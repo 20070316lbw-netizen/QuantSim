@@ -1,0 +1,50 @@
+{
+  "format_version": 2,
+  "provider": "QuantSim synthetic fixture",
+  "source_ref": "fixture:historical-market",
+  "venue": "XNYS",
+  "currency": "USD",
+  "exchange_timezone": "America/New_York",
+  "price_basis": "raw",
+  "instruments": [
+    {"instrument_id": "00000000-0000-0000-0000-00000000000b", "instrument_key": "fixture-11", "symbol": "OLD", "name": "Renamed Example", "listed_on": "2024-07-02", "listing_available_at": "2024-06-28T18:00:00Z"},
+    {"instrument_id": "00000000-0000-0000-0000-00000000000c", "instrument_key": "fixture-12", "symbol": "EXIT", "name": "Delisted Example", "listed_on": "2024-07-02", "listing_available_at": "2024-06-28T18:00:00Z", "delisted_on": "2024-07-05", "delisting_available_at": "2024-07-03T18:00:00Z"},
+    {"instrument_id": "00000000-0000-0000-0000-00000000000d", "instrument_key": "fixture-13", "symbol": "OLD", "name": "New Listing Example", "listed_on": "2024-07-05", "listing_available_at": "2024-07-02T15:00:00Z"}
+  ],
+  "sessions": [
+    {"session_date": "2024-07-02", "market_close_at": "2024-07-02T20:00:00Z", "cutoff_at": "2024-07-02T20:00:00Z"},
+    {"session_date": "2024-07-03", "market_close_at": "2024-07-03T17:00:00Z", "cutoff_at": "2024-07-03T17:00:00Z"},
+    {"session_date": "2024-07-05", "market_close_at": "2024-07-05T20:00:00Z", "cutoff_at": "2024-07-05T20:00:00Z"},
+    {"session_date": "2024-07-08", "market_close_at": "2024-07-08T20:00:00Z", "cutoff_at": "2024-07-08T20:00:00Z"}
+  ],
+  "symbols": [
+    {"instrument_key": "fixture-11", "effective_on": "2024-07-02", "available_at": "2024-06-28T18:00:00Z", "symbol": "OLD"},
+    {"instrument_key": "fixture-11", "effective_on": "2024-07-05", "available_at": "2024-07-03T18:00:00Z", "symbol": "NEW"},
+    {"instrument_key": "fixture-12", "effective_on": "2024-07-02", "available_at": "2024-06-28T18:00:00Z", "symbol": "EXIT"},
+    {"instrument_key": "fixture-13", "effective_on": "2024-07-05", "available_at": "2024-07-02T15:00:00Z", "symbol": "OLD"}
+  ],
+  "pool_changes": [
+    {"pool_name": "historical", "instrument_key": "fixture-11", "effective_on": "2024-07-02", "available_at": "2024-06-28T18:00:00Z", "is_member": true},
+    {"pool_name": "historical", "instrument_key": "fixture-12", "effective_on": "2024-07-02", "available_at": "2024-06-28T18:00:00Z", "is_member": true},
+    {"pool_name": "historical", "instrument_key": "fixture-12", "effective_on": "2024-07-05", "available_at": "2024-07-03T18:00:00Z", "is_member": false},
+    {"pool_name": "historical", "instrument_key": "fixture-13", "effective_on": "2024-07-05", "available_at": "2024-07-03T18:00:00Z", "is_member": true}
+  ],
+  "bars": [
+    {"instrument_key": "fixture-11", "session_date": "2024-07-02", "available_at": "2024-07-02T20:00:00Z", "open": "100", "high": "101", "low": "99", "close": "100", "volume": 100, "tradable": true},
+    {"instrument_key": "fixture-12", "session_date": "2024-07-02", "available_at": "2024-07-02T20:00:00Z", "open": "20", "high": "20", "low": "20", "close": "20", "volume": 100, "tradable": true},
+    {"instrument_key": "fixture-12", "session_date": "2024-07-03", "available_at": "2024-07-03T17:15:00Z", "open": "18", "high": "18", "low": "18", "close": "18", "volume": 100, "tradable": true},
+    {"instrument_key": "fixture-11", "session_date": "2024-07-05", "available_at": "2024-07-05T20:00:00Z", "open": "105", "high": "111", "low": "104", "close": "110", "volume": 200, "tradable": true},
+    {"instrument_key": "fixture-13", "session_date": "2024-07-05", "available_at": "2024-07-05T20:00:00Z", "open": "10", "high": "12", "low": "9", "close": "11", "volume": 500, "tradable": true},
+    {"instrument_key": "fixture-11", "session_date": "2024-07-08", "available_at": "2024-07-08T20:00:00Z", "open": "110", "high": "112", "low": "109", "close": "111", "volume": 250, "tradable": true}
+  ],
+  "session_status": [
+    {"instrument_key": "fixture-11", "session_date": "2024-07-03", "available_at": "2024-07-03T15:00:00Z", "status": "halted"}
+  ],
+  "adjusted_prices": [
+    {"instrument_key": "fixture-11", "session_date": "2024-07-05", "available_at": "2024-07-05T20:00:00Z", "adjusted_close": "55", "method": "provider_split_adjusted"}
+  ],
+  "fundamentals": [
+    {"instrument_key": "fixture-11", "metric": "revenue", "period_end": "2024-06-30", "disclosed_at": "2024-07-03T17:15:00Z", "available_at": "2024-07-03T17:30:00Z", "value": "1250", "unit": "USD"},
+    {"instrument_key": "fixture-11", "metric": "revenue", "period_end": "2024-06-30", "disclosed_at": "2024-07-08T15:00:00Z", "available_at": "2024-07-08T15:30:00Z", "value": "1200", "unit": "USD"}
+  ]
+}

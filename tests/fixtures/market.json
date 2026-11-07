@@ -1,0 +1,104 @@
+{
+  "format_version": 2,
+  "provider": "QuantSim synthetic fixture",
+  "source_ref": "fixture:market",
+  "venue": "XNYS",
+  "currency": "USD",
+  "exchange_timezone": "America/New_York",
+  "price_basis": "raw",
+  "instruments": [
+    {
+      "instrument_id": "00000000-0000-0000-0000-000000000001",
+      "symbol": "A",
+      "instrument_key": "A",
+      "name": "Fixture A",
+      "listed_on": "2024-07-02",
+      "listing_available_at": "2024-06-28T18:00:00Z"
+    },
+    {
+      "instrument_id": "00000000-0000-0000-0000-000000000002",
+      "symbol": "B",
+      "instrument_key": "B",
+      "name": "Fixture B",
+      "listed_on": "2024-07-02",
+      "listing_available_at": "2024-06-28T18:00:00Z"
+    }
+  ],
+  "sessions": [
+    {
+      "session_date": "2024-07-02",
+      "market_close_at": "2024-07-02T20:00:00Z",
+      "cutoff_at": "2024-07-02T20:00:00Z"
+    },
+    {
+      "session_date": "2024-07-03",
+      "market_close_at": "2024-07-03T17:00:00Z",
+      "cutoff_at": "2024-07-03T17:00:00Z"
+    },
+    {
+      "session_date": "2024-07-05",
+      "market_close_at": "2024-07-05T20:00:00Z",
+      "cutoff_at": "2024-07-05T20:00:00Z"
+    }
+  ],
+  "bars": [
+    {
+      "instrument_key": "A",
+      "session_date": "2024-07-02",
+      "available_at": "2024-07-02T20:00:00Z",
+      "open": "10",
+      "high": "10",
+      "low": "10",
+      "close": "10",
+      "volume": 100,
+      "tradable": true
+    },
+    {
+      "instrument_key": "A",
+      "session_date": "2024-07-03",
+      "available_at": "2024-07-03T17:00:00Z",
+      "open": "11",
+      "high": "11",
+      "low": "11",
+      "close": "11",
+      "volume": 0,
+      "tradable": false
+    },
+    {
+      "instrument_key": "B",
+      "session_date": "2024-07-03",
+      "available_at": "2024-07-03T17:15:00Z",
+      "open": "20",
+      "high": "20",
+      "low": "20",
+      "close": "20",
+      "volume": 100,
+      "tradable": true
+    },
+    {
+      "instrument_key": "A",
+      "session_date": "2024-07-05",
+      "available_at": "2024-07-05T20:00:00Z",
+      "open": "22",
+      "high": "22",
+      "low": "22",
+      "close": "22",
+      "volume": 100,
+      "tradable": true
+    }
+  ],
+  "symbols": [
+    {
+      "instrument_key": "A",
+      "effective_on": "2024-07-02",
+      "available_at": "2024-06-28T18:00:00Z",
+      "symbol": "A"
+    },
+    {
+      "instrument_key": "B",
+      "effective_on": "2024-07-02",
+      "available_at": "2024-06-28T18:00:00Z",
+      "symbol": "B"
+    }
+  ]
+}

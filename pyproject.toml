@@ -1,0 +1,23 @@
+[project]
+name = "quantsim"
+version = "0.1.0"
+description = "本地量化交易回放模拟器"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "duckdb>=1.5.6",
+    "pandas>=3.0.6",
+    "quanttoolkit",
+]
+
+[tool.uv.sources]
+quanttoolkit = { path = "../quant/QuantToolKit", editable = true }
+
+[build-system]
+requires = ["uv_build>=0.12.22,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.17.0",
+]
