@@ -1,5 +1,9 @@
 # QuantSim
 
+[![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
+
+![Assisted by Codex](assets/assisted-by-codex.svg)
+
 运行于 macOS 本机的量化交易回放模拟器。当前可在 DuckDB 导入冻结日频行情，查询带历史证券池、披露时点和逐值来源的市场快照，并运行第一项 QuantToolKit 策略特征。见 [历史市场导入与查询示例](docs/historical_market.md) 和 [开发流程说明书](docs/development_guide.md)。M0–M5 的早期技术拆解与交付记录见 [实施计划](docs/implementation_plan.md)。
 
 ## 安装与测试

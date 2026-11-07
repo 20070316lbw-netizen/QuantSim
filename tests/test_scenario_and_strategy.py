@@ -6,13 +6,15 @@ test_fixed_strategy_uses_the_current_view_and_actual_positions 检查当前行�
 """
 
 import json
-from datetime import date, timedelta
+from dataclasses import replace
+from datetime import UTC, date, datetime, timedelta
 from uuid import UUID
 
 import pytest
 from conftest import FIXTURE
 
 from quantsim.errors import ErrorCode, SimulatorError
+from quantsim.market_data import Tick
 from quantsim.scenario import ScenarioEvent, ScenarioEventEngine, ScenarioState
 from quantsim.simulation_clock import SimulationClock
 from quantsim.strategy import FixedRoundTripStrategy, OrderIntent, StrategyContext
@@ -69,6 +71,21 @@ def test_scenario_rejects_a_late_old_event_that_would_reverse_a_newer_state(mark
     assert error.value.code is ErrorCode.INVALID_REQUEST
 
 
+def test_scenario_rejects_invalid_event_types():
+    at = datetime(2024, 7, 2, 20, tzinfo=UTC)
+    tick = Tick(at.date(), at, at, 1)
+    halt = ScenarioEvent(1, at, at, "halt", A)
+    for event in (
+        replace(halt, instrument_id=str(A)),
+        replace(halt, effective_at=at.isoformat()),
+        replace(halt, available_at=None),
+        None,
+    ):
+        with pytest.raises(SimulatorError) as error:
+            ScenarioEventEngine.apply(tick, ScenarioState(), (event,))
+        assert error.value.code is ErrorCode.INVALID_REQUEST
+
+
 def test_fixed_strategy_uses_the_current_view_and_actual_positions(market, tmp_path):
     original = market.import_batch(FIXTURE).data_version
     bundle = json.loads(FIXTURE.read_bytes())
@@ -93,6 +110,7 @@ def test_fixed_strategy_uses_the_current_view_and_actual_positions(market, tmp_p
         second = clock.peek()
         second_view = market.view(version, second.session_date)
         assert strategy.decide(StrategyContext(second, second_view, {}, state)) == ()
+        # 当日 bar 虽不可成交, 仍可作为下一 tick 清仓决策的观察
         assert strategy.decide(
             StrategyContext(second, second_view, {A: 10}, state)
         ) == (OrderIntent(A, "sell", 10),)

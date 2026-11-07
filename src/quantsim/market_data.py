@@ -5,7 +5,7 @@ version、versions、pools 和 raw_source 查询批次、证券池及原始归�
 sessions 调用 _check_range、_read_manifest 和 _sessions 读取日历, view 用日历构建 MarketView
 snapshot 调用 validate_projection 和 read_snapshot 组装时点快照
 history 按日期和可用时刻读取 BarBatch, session_bars 将范围限定到 tick 当日
-MarketView.session、sessions、history 和 snapshot 将策略或撮合的查询绑定到当前交易日
+MarketView.session、sessions、history、latest_bars 和 snapshot 将策略、撮合或估值查询绑定到当前交易日
 _parse_batch 使用 _price 及时间解析校验行情, _insert_instrument 和 _insert_bars 写入规范化数据
 """
 
@@ -116,6 +116,17 @@ class MarketView:
             start=sessions[0].session_date,
             end=self.session.session_date,
             as_of=self.session.cutoff_at,
+        )
+
+    def latest_bars(self, instruments: tuple[UUID, ...]) -> BarBatch:
+        """每个证券最多返回一根截至当前 cutoff 可见的原始 bar"""
+        return self._repository.history(
+            self.data_version,
+            instruments,
+            start=self._sessions[0].session_date,
+            end=self.session.session_date,
+            as_of=self.session.cutoff_at,
+            latest_per_instrument=True,
         )
 
     def snapshot(
@@ -357,17 +368,25 @@ class MarketDataRepository:
         start: date,
         end: date,
         as_of: datetime,
+        latest_per_instrument: bool = False,
     ) -> BarBatch:
+        """按交易日及可用时刻读取原始行情, 可限定每只证券只取最后一根"""
         _check_range(start, end)
         if not isinstance(as_of, datetime) or as_of.utcoffset() is None:
             raise SimulatorError(ErrorCode.INVALID_REQUEST, "as_of 须带时区")
         as_of = as_of.astimezone(UTC)
+        latest_clause = (
+            "QUALIFY row_number() OVER (PARTITION BY b.instrument_id "
+            "ORDER BY b.session_date DESC) = 1"
+            if latest_per_instrument
+            else ""
+        )
         try:
             with duckdb.connect(self._path, read_only=True) as connection:
                 _read_manifest(connection, data_version)
                 connection.execute("SET TimeZone = 'UTC'")
                 rows = connection.execute(
-                    """
+                    f"""
                     SELECT b.instrument_id, i.instrument_key, b.session_date,
                            b.bar_end_at, b.available_at, b.open, b.high, b.low, b.close,
                            b.volume, b.tradable, b.source_ref
@@ -379,6 +398,7 @@ class MarketDataRepository:
                       AND b.session_date BETWEEN ? AND ?
                       AND b.bar_end_at <= ? AND b.available_at <= ?
                       AND l.listing_available_at <= ?
+                    {latest_clause}
                     ORDER BY b.session_date, i.instrument_key
                     """,
                     [data_version, list(instruments), start, end, as_of, as_of, as_of],

@@ -14,7 +14,7 @@
 | `Fill` / `ExecutionResult` | 成交含订单 ID、参考价、成交价、股数、费用、成交时刻和 bar 引用。结果还含按订单顺序输出的结束原因，初期每单至多一笔成交 |
 | `PortfolioState` / `PortfolioSnapshot` | 状态含现金和各证券股数。快照再含逐证券标记价、行情引用、stale、日终权益和 tick |
 | `ScenarioState` | 已生效的市场或证券限制。首版事件为 halt / resume，可冻结撮合直到恢复 |
-| `Capability` | 工具箱全名、公开契约、Simulator 用途与是否启用。面向策略的调用仅显示启用的策略能力 |
+| `Capability` | `name` 为工具箱全名，`contract` 为公开契约，`enabled_for_strategy` 表示是否向策略启用 |
 
 账本价和金额用 Decimal。研究面板与统计由 Adapter 转为 pandas 数值。运行期间同一证券 ID 映射到唯一 Toolkit ticker，市场/证券代码不直接充当持久化主键。
 
@@ -30,13 +30,14 @@ def history(
     start: date,
     end: date,
     as_of: datetime,
+    latest_per_instrument: bool = False,
 ) -> BarBatch: ...
 def session_bars(
     data_version: str, instruments: tuple[UUID, ...], *, tick: Tick
 ) -> BarBatch: ...
 ```
 
-`import_batch` 校验日历、市场、币种、唯一键和时区，按内容锁定版本。输入为当前历史市场格式的本地 JSON 文件。相同批次重复导入返回同一版本，内容变更得到新版本。读接口同时要求 `bar_end_at <= as_of`、`available_at <= as_of`。历史查询范围按当地交易日闭区间，交易日来自清单。`session_bars` 只给当期已发布真实 bar，缺失证券不生成伪行。数据库失败返回 `DATA_UNAVAILABLE`，合法缺行用空结果表达。
+`import_batch` 校验日历、市场、币种、唯一键和时区，按内容锁定版本。输入为当前历史市场格式的本地 JSON 文件。相同批次重复导入返回同一版本，内容变更得到新版本。读接口同时要求 `bar_end_at <= as_of`、`available_at <= as_of`。历史查询范围按当地交易日闭区间，交易日来自清单。`session_bars` 只给当期已发布真实 bar。`MarketView.latest_bars(instruments)` 在绑定的交易日及 cutoff 内为每只证券查询最近一根可见原始 bar，用于估值。数据库失败返回 `DATA_UNAVAILABLE`，合法缺行用空结果表达。
 
 ### 分钟行情预留
 
@@ -89,9 +90,9 @@ def apply(
 def decide(context: StrategyContext) -> tuple[OrderIntent, ...]: ...
 ```
 
-`StrategyContext` 含当前 tick、MarketView、最新 PortfolioSnapshot、可见 ScenarioState 及策略专用 QuantToolkitAdapter 接口。初期策略状态可由输入、配置与持仓完全重建。历史不足返回空元组，意图顺序稳定。策略只能得到截至此刻已发布的特征。目标权重是研究产物，未来接入时由策略层显式决定其订单换算、空头约束和遗漏证券处理。
+当前 `StrategyContext` 含 `tick`、绑定该 tick 的 `market: MarketView`、当前股数 `positions` 及场景限制 `limits: ScenarioState`。完整组合快照和策略特征入口随策略扩展再接入。届时特征仍受当前 cutoff 约束，目标权重由策略层显式换算为订单。
 
-当前的 [FixedRoundTripStrategy](../src/quantsim/strategy.py) 用于三日验收。它接收 tick、绑定该 tick 的市场视图、当前股数和交易限制。证券当前可见且未受场景限制时，第一日从空仓提交定量买入，第二日按实际持仓提交卖出。策略输出订单意图，由撮合环节决定实际成交。
+当前的 [FixedRoundTripStrategy](../src/quantsim/strategy.py) 用于三日验收。场景允许交易且当日存在可见原始 bar 时，第一日从空仓生成定量买入意图，第二日按实际持仓生成卖出意图。提交日的零量、历史停牌和 `tradable` 标记可以作为行情观察的一部分，订单的成交资格按目标 tick 的历史交易状态、行情和场景限制检查。
 
 ## ExecutionEngine
 
@@ -108,16 +109,25 @@ def execute(
 
 只处理 `target_tick == tick.seq` 的有效订单，按 `(submitted_tick, intent_seq)` 排序。订单目标须恰为提交后的下一 tick。当前实现从绑定当前 tick 的 MarketView 读取规范化原始快照，要求真实、可交易、正量且当时可见的当期 bar。单只证券的成交容量为 `floor(volume * participation_rate)`，供本 tick 内的订单共用。首版滑点为 0，参考价与成交价均为原始 close。
 
-成交额和费用各自按账户最小货币单位半偶舍入，费用基于未舍入的成交额。撮合使用独立的 Decimal 上下文。若成交额舍入为零，订单以 `zero_notional` 结束，现金、持仓和容量均不变。结束原因依次检查场景或上市状态、缺失或迟到 bar、零成交量、不可交易、容量、零成交额、资金及可卖量。订单全成或结束，卖出款在模拟账户即时可用。返回待提交的成交及预计算状态，数据库失败时可重算。见 [execution.py](../src/quantsim/execution.py)。
+成交额和费用各自按账户最小货币单位半偶舍入，费用基于未舍入的成交额。撮合使用独立的 Decimal 上下文。若成交额舍入为零，订单以 `zero_notional` 结束，现金、持仓和容量均不变。场景限制或已知的停牌、无交易、未上市及退市状态记为 `not_tradable`。缺少可见 bar 记为 `no_bar`，包括行情迟到或上市记录尚不可见。随后依次检查零成交量、bar 的不可交易标记、容量、零成交额、资金及可卖量。订单全成或结束，卖出款在模拟账户即时可用。返回待提交的成交及预计算状态，数据库失败时可重算。见 [execution.py](../src/quantsim/execution.py)。
+
+到期订单的证券须属于冻结数据版本。未知证券会使调用返回 `INVALID_REQUEST`。回放协调器在接受订单意图时前置校验这一约束。
 
 ## PortfolioManager
 
 ```python
+def initialize(initial_cash: Decimal, *, currency_unit: Decimal) -> BookingResult: ...
 def apply_fills(state: PortfolioState, fills: tuple[Fill, ...]) -> BookingResult: ...
-def mark(tick: Tick, state: PortfolioState, marks: MarkSet) -> PortfolioSnapshot: ...
+def mark(
+    tick: Tick, state: PortfolioState, market: MarketView, *, currency_unit: Decimal
+) -> PortfolioSnapshot: ...
 ```
 
-初始现金是显式流水。按成交顺序形成有符号的交易净流水，买入为 `-(成交额 + 费用)`，卖出为 `成交额 - 费用`。每笔流水和持仓使用同一成交金额口径。重复成交 ID、未知证券或超出只做多/现金限制属于状态不一致，回放步骤回滚。估值采用当期原始 close 或上一个已知真实价并带 stale，记录引用价格的日期。权益为现金加持仓市值。组合收益入口接受由日终权益和期初资金推导的序列，验证期序和权益。初期无外部入金和出金，仅初始化账户。
+[`portfolio.py`](../src/quantsim/portfolio.py) 的 `initialize` 按账户最小货币单位半偶舍入初始现金，舍入后须大于零。`BookingResult` 包含新账户状态和有序的 `CashEntry`。初始流水的 `order_id` 为 `None`，成交流水通过订单 ID 关联首版每单唯一的成交。
+
+`apply_fills` 接收当期撮合产出的有序成交，使用已舍入的成交额和费用。买入净流水为 `-(成交额 + 费用)`，卖出为 `成交额 - 费用`，清仓后移除零股持仓。批内重复订单、过账字段无效或任一笔成交后现金或股数为负，均返回 `INCONSISTENT_STATE`，输入状态可用于重算。协调器负责在提交时验证成交与订单、运行版本及 tick 的对应关系，并按检查点防止重复过账。
+
+`mark` 使用与 tick 绑定的视图，按证券 ID 顺序返回非零持仓的估值。优先使用当日可见原始 close，缺价时用当前 cutoff 下最近的历史原始 close 并标记 `stale`。可见的零量或不可成交 bar 仍可用于估值。快照保存数据版本、标记价日期和原始 bar 引用，任一持仓缺少可见原始价时返回 `DATA_UNAVAILABLE`。日终权益为现金加各证券分别舍入后的市值，空仓日权益等于现金。货币单位与 `ExecutionConfig.currency_unit` 一致。账本与快照的持久化由回放协调器接入。
 
 ## QuantToolkitAdapter
 
@@ -155,4 +165,4 @@ def report(
 
 `historical_return` 是当前启用的策略特征。`params` 为映射，可包含 `n_periods`，默认 5，范围为 1 至 2³¹−1。Adapter 按冻结日历向前数 `n_periods` 个交易日，用两端在当前 MarketView 的 cutoff 前已发布的原始 `close` 计算，含恰在 cutoff 发布的行情。起点超出 `lookback_sessions` 或缺价时，当前观察的收益为 `None`。中间交易日即使缺行也计入期数，只要两端价格都可见就可以计算。输出只包含实际可见的行情观察，并保留请求证券、截止时点及批次 ID。
 
-`capabilities` 与 `describe` 可查看 Toolkit 目录。当前计算入口为 `for_strategy` 所提供的特征。其余设计接口按实施计划加入。
+`capabilities` 与 `describe` 可查看 Toolkit 目录。Toolkit 的当前计算入口为 `for_strategy` 所提供的特征。日频回放组件可分别调用，当前覆盖时钟、场景、固定策略、撮合及账户账本。其余接口按实施计划加入。

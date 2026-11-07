@@ -50,15 +50,22 @@ class ScenarioEventEngine:
         sequences = set()
         for event in pending:
             if (
-                type(event.scenario_sequence) is not int
+                not isinstance(event, ScenarioEvent)
+                or type(event.scenario_sequence) is not int
                 or event.scenario_sequence < 0
                 or event.scenario_sequence in sequences
                 or event.action not in ("halt", "resume")
+                or (
+                    event.instrument_id is not None
+                    and not isinstance(event.instrument_id, UUID)
+                )
+                or not isinstance(event.effective_at, datetime)
+                or not isinstance(event.available_at, datetime)
                 or event.effective_at.utcoffset() != timedelta(0)
                 or event.available_at.utcoffset() != timedelta(0)
             ):
                 raise SimulatorError(
-                    ErrorCode.INVALID_REQUEST, "场景事件的序号、动作或时刻无效"
+                    ErrorCode.INVALID_REQUEST, "场景事件的序号、动作、证券或时刻无效"
                 )
             sequences.add(event.scenario_sequence)
 

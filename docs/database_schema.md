@@ -4,7 +4,7 @@ QuantSim 使用独立本地数据库。初期由单个回放进程串行写入�
 
 ## 时间、精度与数据来源
 
-- `session_date DATE` 表示交易所当地交易日。`*_at TIMESTAMPTZ` 存储实际时刻，连接按 UTC 读写，界面按交易所时区显示。交易所日历独立保存时区与每个 session 的 close、cutoff，包含节假日与提前收盘。运行中的排序以 tick 和顺序号为准。真实创建时间与模拟时刻分字段保存。 [DuckDB 时间类型](https://duckdb.org/docs/current/sql/data_types/timestamp)
+- `session_date DATE` 表示交易所当地交易日。`*_at TIMESTAMPTZ` 存储实际时刻。行情历史和快照查询以 UTC 读回，直接查询迁移历史等表时，返回的时区偏移由查询连接的 `TimeZone` 决定。界面计划按交易所时区显示。交易所日历独立保存时区与每个 session 的 close、cutoff，包含节假日与提前收盘。运行中的排序以 tick 和顺序号为准。真实创建时间与模拟时刻分字段保存。 [DuckDB 时间类型](https://duckdb.org/docs/current/sql/data_types/timestamp)
 - 原始 OHLC、成交价和标记价采用 `DECIMAL(20,8)`，整数股与成交量用 `BIGINT`。账本用 `DECIMAL(24,8)`，账户的最小货币单位写入运行配置，落库前按账户规则舍入。成交额先以 Decimal 计算并舍入至最小货币单位。费用以未舍入成交额乘费率后独立舍入。逐证券市值按同一精度舍入，余额与权益以舍入后的值加总。研究收益和指标独立使用浮点数。
 - `data_version` 是冻结导入清单的内容摘要，清单覆盖数据文件哈希、提供者、导入规则版本、单市场日历、证券映射和价格口径。清单与原始文件字节保存在 `market_datasets`，和证券、时点元数据及行情在同一个事务写入。创建运行时将已验证清单复制到 `simulations.data_manifest`，并检查对应批次、日历覆盖和币种。数据纠正产生新版本。行情行的 `source_ref` 指向具体导入对象或 fixture 记录。行情表首版只接受真实观测，研究补齐只在派生视图进行。
 - 交易 ID 为 UUID，回放派生 ID 由运行 ID 和稳定业务键生成。同一运行的 retry 保持 ID。复合外键约束运行、订单、证券及行情的一致性。事件源 ID 放入 `source_ref`，场景原始参数和每次实际生效的序号分别保留。

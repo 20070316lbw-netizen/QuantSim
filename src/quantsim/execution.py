@@ -2,25 +2,23 @@
 
 execute 校验订单、账户和配置, 通过 MarketView.snapshot 获取当日可见的原始行情
 函数按提交顺序检查场景、成交资格、容量和购买力, 返回成交或结束原因及预计算后的现金和持仓
-内部 money 按货币单位半偶舍入成交额和费用, 输入状态不被修改
-结果尚未写入账本或数据库, 由后续回放协调器负责提交
+成交额和费用按账户货币单位半偶舍入, 输入状态不被修改
+portfolio.apply_fills 用成交生成现金流水及持仓, 由后续回放协调器负责提交
 """
 
 from dataclasses import dataclass
 from datetime import date, datetime
-from decimal import (
-    ROUND_FLOOR,
-    ROUND_HALF_EVEN,
-    Context,
-    Decimal,
-    DivisionByZero,
-    InvalidOperation,
-    Overflow,
-    localcontext,
-)
+from decimal import ROUND_FLOOR, Decimal
 from typing import Literal
 from uuid import UUID
 
+from quantsim._account import (
+    PortfolioState,
+    account_context,
+    round_money,
+    valid_currency_unit,
+    validate_state,
+)
 from quantsim.errors import ErrorCode, SimulatorError
 from quantsim.market_data import MarketView, Tick
 from quantsim.scenario import ScenarioState
@@ -42,12 +40,6 @@ class ExecutionConfig:
     participation_rate: Decimal
     fee_rate: Decimal
     currency_unit: Decimal = Decimal("0.01")
-
-
-@dataclass(frozen=True)
-class PortfolioState:
-    cash: Decimal
-    positions: dict[UUID, int]
 
 
 @dataclass(frozen=True)
@@ -107,29 +99,16 @@ def execute(
         or not isinstance(config.fee_rate, Decimal)
         or not config.fee_rate.is_finite()
         or not 0 <= config.fee_rate <= 1
-        or not isinstance(config.currency_unit, Decimal)
-        or not config.currency_unit.is_finite()
-        or config.currency_unit <= 0
+        or not valid_currency_unit(config.currency_unit)
     ):
         raise SimulatorError(ErrorCode.INVALID_REQUEST, "撮合费率、容量或货币单位无效")
-    if (
-        not isinstance(state.cash, Decimal)
-        or not state.cash.is_finite()
-        or state.cash < 0
-        or any(
-            not isinstance(k, UUID) or type(v) is not int or v < 0
-            for k, v in state.positions.items()
-        )
-    ):
-        raise SimulatorError(ErrorCode.INVALID_REQUEST, "账户现金或持仓无效")
+    validate_state(state)
     ids, keys = set(), set()
     for order in orders:
-        key = (order.submitted_tick, order.intent_seq)
         if (
-            not isinstance(order.order_id, UUID)
+            not isinstance(order, Order)
+            or not isinstance(order.order_id, UUID)
             or not isinstance(order.instrument_id, UUID)
-            or order.order_id in ids
-            or key in keys
             or order.side not in ("buy", "sell")
             or type(order.quantity) is not int
             or order.quantity <= 0
@@ -140,9 +119,10 @@ def execute(
             or type(order.target_tick) is not int
             or order.target_tick != order.submitted_tick + 1
         ):
-            raise SimulatorError(
-                ErrorCode.INVALID_REQUEST, "订单结构、顺序或目标 tick 无效"
-            )
+            raise SimulatorError(ErrorCode.INVALID_REQUEST, "订单结构或目标 tick 无效")
+        key = (order.submitted_tick, order.intent_seq)
+        if order.order_id in ids or key in keys:
+            raise SimulatorError(ErrorCode.INVALID_REQUEST, "订单 ID 或提交顺序重复")
         ids.add(order.order_id)
         keys.add(key)
     due = sorted(
@@ -153,24 +133,7 @@ def execute(
     snapshot = market.snapshot(pool=instruments, fields=("close", "volume", "tradable"))
     rows = {row.instrument_id: row for row in snapshot.rows}
     cash, positions, capacity, outcomes = state.cash, dict(state.positions), {}, []
-    # 隔离调用方的精度、舍入、指数范围和异常设置
-    context = Context(
-        prec=80,
-        rounding=ROUND_HALF_EVEN,
-        Emin=-999999,
-        Emax=999999,
-        capitals=1,
-        clamp=0,
-        flags=[],
-        traps=[InvalidOperation, DivisionByZero, Overflow],
-    )
-    with localcontext(context):
-
-        def money(value: Decimal) -> Decimal:
-            return (value / config.currency_unit).quantize(
-                Decimal(1), rounding=ROUND_HALF_EVEN
-            ) * config.currency_unit
-
+    with account_context():
         for order in due:
             row = rows[order.instrument_id]
             close, volume, tradable = (
@@ -201,7 +164,8 @@ def execute(
                     reason = "insufficient_capacity"
                 else:
                     raw = close.value * order.quantity
-                    notional, fee = money(raw), money(raw * config.fee_rate)
+                    notional = round_money(raw, config.currency_unit)
+                    fee = round_money(raw * config.fee_rate, config.currency_unit)
                     if notional == 0:
                         reason = "zero_notional"
                     elif order.side == "buy" and cash < notional + fee:

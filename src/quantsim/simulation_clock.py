@@ -5,7 +5,7 @@ peek 返回下一未提交 Tick, 区间结束时返回 None
 advance 在调用方确认提交后推进序号, 拒绝跳步或重复推进
 """
 
-from datetime import timedelta
+from datetime import date, datetime, timedelta
 from itertools import pairwise
 
 from quantsim.errors import ErrorCode, SimulatorError
@@ -25,14 +25,18 @@ class SimulationClock:
             raise SimulatorError(ErrorCode.INVALID_REQUEST, "已提交序号超出回放范围")
 
         if any(
-            session.market_close_at.utcoffset() != timedelta(0)
+            not isinstance(session, Session)
+            or type(session.session_date) is not date
+            or not isinstance(session.market_close_at, datetime)
+            or not isinstance(session.cutoff_at, datetime)
+            or session.market_close_at.utcoffset() != timedelta(0)
             or session.cutoff_at.utcoffset() != timedelta(0)
             or session.cutoff_at < session.market_close_at
             for session in self._sessions
         ):
             raise SimulatorError(
                 ErrorCode.INVALID_REQUEST,
-                "收盘和 cutoff 须为 UTC，且 cutoff 不早于收盘",
+                "日历须包含交易日期和 UTC 时刻，且 cutoff 不早于收盘",
             )
         if any(
             left.session_date >= right.session_date

@@ -9,6 +9,7 @@ test_shared_capacity_and_sale_proceeds 检查共享容量和卖出款可用性
 """
 
 import json
+from dataclasses import replace
 from datetime import date
 from decimal import ROUND_FLOOR, Decimal, Inexact, localcontext
 from uuid import UUID
@@ -16,7 +17,7 @@ from uuid import UUID
 import pytest
 from conftest import FIXTURE
 
-from quantsim.errors import SimulatorError
+from quantsim.errors import ErrorCode, SimulatorError
 from quantsim.execution import ExecutionConfig, Order, PortfolioState, execute
 from quantsim.scenario import ScenarioState
 from quantsim.simulation_clock import SimulationClock
@@ -109,6 +110,43 @@ def test_missing_late_and_non_tradable_bar(market):
         tick, (order(1), order(2, instrument=B)), view, ScenarioState(), state, config
     )
     assert [outcome.reason for outcome in result.outcomes] == ["zero_volume", "no_bar"]
+
+
+def test_invalid_order_input_returns_invalid_request(market, tmp_path):
+    tick, view = setup_market(market, tmp_path)
+    state = PortfolioState(Decimal(1000), {})
+    config = ExecutionConfig(Decimal(1), Decimal(0))
+    for invalid in (
+        None,
+        replace(order(1), intent_seq=[]),
+        order(1, instrument=UUID(int=3)),
+    ):
+        with pytest.raises(SimulatorError) as error:
+            execute(tick, (invalid,), view, ScenarioState(), state, config)
+        assert error.value.code is ErrorCode.INVALID_REQUEST
+
+
+def test_unavailable_listing_has_no_visible_bar(market, tmp_path):
+    data = json.loads(FIXTURE.read_text())
+    data["instruments"][0]["listing_available_at"] = "2024-07-03T17:00:01Z"
+    data["bars"][1].update(volume=100, tradable=True)
+    path = tmp_path / "late_listing.json"
+    path.write_text(json.dumps(data))
+    version = market.import_batch(path).data_version
+    clock = SimulationClock(
+        market.sessions(version, date(2024, 7, 2), date(2024, 7, 5)), committed_seq=1
+    )
+    tick = clock.peek()
+    view = market.view(version, tick.session_date)
+    result = execute(
+        tick,
+        (order(1),),
+        view,
+        ScenarioState(),
+        PortfolioState(Decimal(1000), {}),
+        ExecutionConfig(Decimal(1), Decimal(0)),
+    )
+    assert [outcome.reason for outcome in result.outcomes] == ["no_bar"]
 
 
 def test_shared_capacity_and_sale_proceeds(market, tmp_path):

@@ -100,6 +100,10 @@ def test_clock_rejects_invalid_calendar_order_and_times():
         ),
         (replace(session, cutoff_at=close - timedelta(minutes=1)),),
         (replace(session, market_close_at=close.replace(tzinfo=None)),),
+        (replace(session, market_close_at="2024-07-03T17:00:00Z"),),
+        (replace(session, cutoff_at=None),),
+        (replace(session, session_date=close),),
+        (None,),
     ):
         with pytest.raises(SimulatorError) as error:
             SimulationClock(sessions)

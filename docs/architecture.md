@@ -1,6 +1,6 @@
 # QuantSim 架构
 
-QuantSim 是运行在 macOS 本机的量化交易终端模拟器。第一条可运行链路用冻结行情和确定性回放验证从决策到成交、账本及绩效的全过程。QuantToolKit 作为独立的 Python 包，继续负责因子、统计、样本、模型和已有回测原语。审计结论与 70 项能力见 [toolkit_integration.md](toolkit_integration.md)。
+QuantSim 是运行在 macOS 本机的量化交易终端模拟器。第一条可运行链路用冻结行情和确定性回放验证从决策到成交、账本及绩效的全过程。QuantToolKit 作为独立的 Python 包，继续负责因子、统计、样本、模型和已有回测原语。审计基线和当前依赖版本见 [toolkit_integration.md](toolkit_integration.md)。
 
 ## 模块依赖
 
@@ -30,7 +30,7 @@ flowchart TD
 | MarketDataRepository | 导入冻结批次，读取交易日历、可见历史和当前实际 bar。用小型 DuckDB 测试时点、缺行与价格口径 |
 | SimulationClock | 按固定日历生成单调 tick，支持从最后已提交 tick 恢复。用含假期和提前收盘的日历测试 |
 | ScenarioEventEngine | 选择在 tick 生效且已发布的场景事件，按固定序应用交易限制。用同一时间多事件和重放测试 |
-| Strategy | 用只读可见行情、组合快照和能力入口生成订单意图。用固定历史与空仓/持仓快照测试 |
+| Strategy | 当前固定策略用只读可见行情、持仓股数和场景限制生成订单意图。后续策略扩展再接组合快照和特征入口 |
 | ExecutionEngine | 对待成交订单应用当期真实 bar、交易限制和资金约束，产生成交或结束原因。用零成交量和现金不足测试 |
 | PortfolioManager | 根据已确认成交更新仓位及现金，以指定估值价生成日终快照。用手算资金和持仓变动测试 |
 | QuantToolkitAdapter | 查询和调用工具箱能力，集中处理 pandas 转换、来源和异常。以真实 Toolkit 验证传入对象和来源路径 |
