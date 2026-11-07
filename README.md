@@ -13,6 +13,8 @@ uv run --locked pytest -q
 
 QuantToolKit 从相对于项目目录的 `../quant/QuantToolKit` 以可编辑模式安装。修改其中的 Python 源码后，新启动的 QuantSim 进程会直接加载修改后的代码。首次安装需要准备该本机目录，其他依赖按 `uv.lock` 安装。下面的示例和测试使用本地 fixture。
 
+推送和提交 Pull Request 时，GitHub Actions 在 macOS 上安装锁定依赖并运行 Ruff 与测试。CI 将 QuantToolKit 检出到相同的相对路径，固定版本写在 [CI workflow](.github/workflows/ci.yml) 中；更新 Toolkit 依赖时需要同时核对该版本和 `uv.lock`。
+
 ## 运行一条特征
 
 ```python
@@ -49,4 +51,4 @@ with TemporaryDirectory() as directory:
 
 导入使用 [历史市场格式](docs/historical_market.md#历史数据包)。每批含单市场、单币种、原始日线、带时区的日历和证券上市记录。调整收盘价在 `adjusted_prices` 中提供独立可用时间。相同文件重复导入返回同一批次 ID。
 
-起步阶段以当前 [数据库结构](src/quantsim/schema.sql) 为准。遇到之前阶段的 DuckDB 文件，请用新路径初始化，再导入当前格式的原始数据包。
+数据库通过 `initialize_database(path)` 初始化并升级到版本 2。版本 1 库可直接升级并保留已有数据，建议升级前备份。升级后可在 `schema_migrations` 查询已应用版本、名称和时间。早于版本 1 且没有匹配版本记录的开发数据库需要重新导入。见 [数据库结构与迁移](docs/database_schema.md#初始化与历史市场表)。

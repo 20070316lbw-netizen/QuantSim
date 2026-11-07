@@ -1,4 +1,9 @@
-"""按冻结的交易日历推进日频回放。"""
+"""根据冻结交易日历提供可恢复的日频时钟
+
+SimulationClock.__init__ 校验日历与已提交序号
+peek 返回下一未提交 Tick, 区间结束时返回 None
+advance 在调用方确认提交后推进序号, 拒绝跳步或重复推进
+"""
 
 from datetime import timedelta
 from itertools import pairwise

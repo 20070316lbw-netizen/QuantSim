@@ -1,3 +1,12 @@
+"""验证冻结行情的导入和时点读取
+
+_modified_fixture 生成修改后的临时数据包, 由导入错误测试调用
+test_frozen_batch_reads_only_observations_published_by_cutoff 和 test_current_session_bars_do_not_use_late_or_prior_bars 检查可见性
+test_duplicate_bars_roll_back_the_entire_import 检查失败回滚
+test_batch_rejects_adjusted_prices_as_raw_bars、test_batch_rejects_non_array_input 和 test_batch_requires_current_historical_market_format 检查输入格式
+test_fixture_price_precision_is_independent_of_caller_context 检查价格精度
+"""
+
 import json
 from datetime import date, datetime
 from decimal import Decimal, localcontext

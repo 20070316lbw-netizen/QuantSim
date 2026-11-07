@@ -1,4 +1,9 @@
-"""为三日回放验收产生固定的买入和清仓意图。"""
+"""生成三日验收使用的固定买入与清仓意图
+
+FixedRoundTripStrategy.__post_init__ 校验目标股数
+FixedRoundTripStrategy.decide 读取当前 MarketView、持仓和 ScenarioState, 第一 tick 产生买入意图, 第二 tick 按实际持仓产生卖出意图
+OrderIntent 是策略输出, 撮合由独立模块决定
+"""
 
 from collections.abc import Mapping
 from dataclasses import dataclass

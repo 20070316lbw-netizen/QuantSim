@@ -99,14 +99,16 @@ def decide(context: StrategyContext) -> tuple[OrderIntent, ...]: ...
 def execute(
     tick: Tick,
     orders: tuple[Order, ...],
-    bars: BarBatch,
+    market: MarketView,
     limits: ScenarioState,
     state: PortfolioState,
     config: ExecutionConfig,
 ) -> ExecutionResult: ...
 ```
 
-只处理 `target_tick == tick.seq` 的有效订单，按 `(submitted_tick, intent_seq)` 排序。必须有真实、可交易、正量且当时可见的当期 bar。按证券的成交容量为 `floor(volume * participation_rate)`，在本 tick 各单间扣减。首版滑点为 0，参考价与成交价为同一原始 close。成交额和费用都按账户最小货币单位进行半偶舍入，费用由未舍入成交额乘配置费率得到。逐单扣减可用容量和现金或可卖量，卖出款在模拟账户即时可用。无 bar、停牌、容量不足、现金不足和可卖量不足分别记录结束原因。不会跨 tick 自动重试，初期省略部分成交和其他委托类型。结果是待提交的成交事实及状态变动，数据库失败时可重算。
+只处理 `target_tick == tick.seq` 的有效订单，按 `(submitted_tick, intent_seq)` 排序。订单目标须恰为提交后的下一 tick。当前实现从绑定当前 tick 的 MarketView 读取规范化原始快照，要求真实、可交易、正量且当时可见的当期 bar。单只证券的成交容量为 `floor(volume * participation_rate)`，供本 tick 内的订单共用。首版滑点为 0，参考价与成交价均为原始 close。
+
+成交额和费用各自按账户最小货币单位半偶舍入，费用基于未舍入的成交额。撮合使用独立的 Decimal 上下文。若成交额舍入为零，订单以 `zero_notional` 结束，现金、持仓和容量均不变。结束原因依次检查场景或上市状态、缺失或迟到 bar、零成交量、不可交易、容量、零成交额、资金及可卖量。订单全成或结束，卖出款在模拟账户即时可用。返回待提交的成交及预计算状态，数据库失败时可重算。见 [execution.py](../src/quantsim/execution.py)。
 
 ## PortfolioManager
 
@@ -149,8 +151,8 @@ def report(
 
 ## 当前可用接口
 
-当前提供 [初始化](../src/quantsim/database.py)、[行情仓库](../src/quantsim/market_data.py) 与 [Toolkit Adapter](../src/quantsim/toolkit_adapter.py)。`import_batch` 接收冻结 JSON 文件的 Path。`market.view(data_version, session_date)` 从清单固定本次查询的交易日和 cutoff。
+当前提供 [初始化](../src/quantsim/database.py)、[行情仓库](../src/quantsim/market_data.py) 与 [Toolkit Adapter](../src/quantsim/toolkit_adapter.py)。`import_batch` 接收冻结 JSON 文件的 Path。`market.view(data_version, session_date)` 从清单固定本次查询的交易日和 cutoff。`MarketView.sessions(lookback_sessions=N)` 返回截至当前交易日的最近 N 个冻结日历 session，包含缺少行情的交易日。
 
-`historical_return` 是当前启用的策略特征。`params` 为映射，可包含 `n_periods`，默认 5，范围为 1 至 2³¹−1。Adapter 选择原始 `close`。当窗口大于可见日期数时，输出均为预热缺值，传给 Toolkit 的窗口限制在可见日期数以内以减少分配。结果保留请求证券、有效观察、截止时点及批次 ID。无可见行情时结果仍保留请求证券。
+`historical_return` 是当前启用的策略特征。`params` 为映射，可包含 `n_periods`，默认 5，范围为 1 至 2³¹−1。Adapter 按冻结日历向前数 `n_periods` 个交易日，用两端在当前 MarketView 的 cutoff 前已发布的原始 `close` 计算，含恰在 cutoff 发布的行情。起点超出 `lookback_sessions` 或缺价时，当前观察的收益为 `None`。中间交易日即使缺行也计入期数，只要两端价格都可见就可以计算。输出只包含实际可见的行情观察，并保留请求证券、截止时点及批次 ID。
 
 `capabilities` 与 `describe` 可查看 Toolkit 目录。当前计算入口为 `for_strategy` 所提供的特征。其余设计接口按实施计划加入。

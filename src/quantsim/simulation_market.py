@@ -1,4 +1,9 @@
-"""从原始价格快照派生模拟市场，保留历史来源。"""
+"""从规范化原始快照派生带来源的价格冲击
+
+simulate_market 按输入顺序将 PriceShock 应用于目标证券, 返回独立的模拟快照
+_apply_shock 计算定点价格并追加来源转换记录, 不修改历史快照
+当前撮合使用原始行情, 不使用此处派生的模拟价格
+"""
 
 from dataclasses import dataclass, replace
 from decimal import (

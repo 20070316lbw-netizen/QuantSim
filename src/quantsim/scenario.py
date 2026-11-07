@@ -1,4 +1,8 @@
-"""按事件的生效时间和可用时间更新回放交易限制。"""
+"""按事件生效时间和可用时间维护交易限制
+
+ScenarioEventEngine.apply 排序并应用当前 tick 可见的 halt / resume 事件, 返回新状态及待处理事件
+ScenarioState.allows_trading 同时检查全市场和单证券限制, 供策略及撮合调用
+"""
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta

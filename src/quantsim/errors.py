@@ -1,11 +1,7 @@
-"""提供 Simulator 调用方可判断的错误代码
+"""统一暴露模拟器错误代码和异常
 
-包装外部异常时保留原始原因。
-
-    try:
-        quantity = int(raw_quantity)
-    except ValueError as exc:
-        raise SimulatorError(ErrorCode.INVALID_REQUEST, "股数须为整数") from exc
+ErrorCode 定义调用方可识别的错误类别
+SimulatorError.__init__ 保存错误代码和可选能力名, 由行情、策略和撮合等模块调用
 """
 
 from enum import StrEnum

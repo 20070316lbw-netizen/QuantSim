@@ -1,4 +1,13 @@
-"""导入冻结的日频行情，并按可用时点读取观察记录。"""
+"""导入冻结行情并提供受时点约束的读取入口
+
+MarketDataRepository.import_batch 调用 _parse_batch 和 parse_metadata 校验输入, 再调用 _insert_instrument、write_metadata 和 _insert_bars 原子写入
+version、versions、pools 和 raw_source 查询批次、证券池及原始归档
+sessions 调用 _check_range、_read_manifest 和 _sessions 读取日历, view 用日历构建 MarketView
+snapshot 调用 validate_projection 和 read_snapshot 组装时点快照
+history 按日期和可用时刻读取 BarBatch, session_bars 将范围限定到 tick 当日
+MarketView.session、sessions、history 和 snapshot 将策略或撮合的查询绑定到当前交易日
+_parse_batch 使用 _price 及时间解析校验行情, _insert_instrument 和 _insert_bars 写入规范化数据
+"""
 
 import json
 from dataclasses import dataclass
@@ -86,19 +95,25 @@ class MarketView:
     def session(self) -> Session:
         return self._sessions[-1]
 
-    def history(
-        self, instruments: tuple[UUID, ...], *, lookback_sessions: int
-    ) -> BarBatch:
+    def sessions(self, *, lookback_sessions: int) -> tuple[Session, ...]:
+        """返回截至当前交易日的最近 N 个日历 session, 含缺行情的交易日
+
+        lookback_sessions 须为正整数, 超出可见范围时返回全部可见 session
+        """
         if type(lookback_sessions) is not int or lookback_sessions < 1:
             raise SimulatorError(
                 ErrorCode.INVALID_REQUEST, "lookback_sessions 须为正整数"
             )
+        return self._sessions[-lookback_sessions:]
+
+    def history(
+        self, instruments: tuple[UUID, ...], *, lookback_sessions: int
+    ) -> BarBatch:
+        sessions = self.sessions(lookback_sessions=lookback_sessions)
         return self._repository.history(
             self.data_version,
             instruments,
-            start=self._sessions[
-                -min(lookback_sessions, len(self._sessions))
-            ].session_date,
+            start=sessions[0].session_date,
             end=self.session.session_date,
             as_of=self.session.cutoff_at,
         )

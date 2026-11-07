@@ -1,3 +1,10 @@
+"""验证场景事件顺序与固定策略
+
+test_scenario_applies_in_order_and_waits_for_effective_and_available_times 检查事件生效、发布和排序
+test_scenario_rejects_a_late_old_event_that_would_reverse_a_newer_state 检查迟到事件顺序
+test_fixed_strategy_uses_the_current_view_and_actual_positions 检查当前行情、持仓及未来数据隔离
+"""
+
 import json
 from datetime import date, timedelta
 from uuid import UUID

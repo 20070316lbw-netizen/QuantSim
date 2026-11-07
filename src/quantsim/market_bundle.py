@@ -1,4 +1,10 @@
-"""校验并规范化历史市场附属数据。"""
+"""校验历史市场附属数据并写入规范化表
+
+timestamp、text 和 decimal_value 分别解析时间、非空文本和定点数, 供行情导入共用
+parse_metadata 校验上市、代码、证券池、交易状态、复权价与财报, 统计缺行覆盖
+parse_metadata 内的 require_active 核对上市区间, 并调用 _check_symbol_history 和 _check_series_units 核对跨记录关系
+write_metadata 将校验后的记录写入对应表, 由 MarketDataRepository.import_batch 在导入事务中调用
+"""
 
 import re
 from bisect import bisect_left

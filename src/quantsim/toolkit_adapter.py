@@ -1,4 +1,10 @@
-"""通过 QuantToolKit 公开契约提供受时点约束的策略能力。"""
+"""通过 QuantToolKit 公开契约提供受时点约束的策略特征
+
+QuantToolkitAdapter.__init__ 加载并核对公开函数签名及来源契约
+capabilities 和 describe 查询能力, for_strategy 将当前 MarketView 绑定到 StrategyAnalytics
+StrategyAnalytics.feature 读取可见历史, 调用 Toolkit 的 to_date_ticker_frame 和 historical_return, 再转换为 FeatureResult
+当前仅 historical_return 在策略通道启用
+"""
 
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -122,6 +128,10 @@ class StrategyAnalytics:
         lookback_sessions: int,
         params: Mapping[str, int] | None = None,
     ) -> FeatureResult:
+        """按冻结交易日历计算策略特征, 只返回实际可见行情对应的点
+
+        historical_return 的端点缺失时返回 None, 缺失交易日仍计入期数
+        """
         if not self._adapter.describe(name).enabled_for_strategy:
             raise SimulatorError(
                 ErrorCode.CAPABILITY_DISABLED, f"策略通道未启用 {name}", capability=name
@@ -142,14 +152,20 @@ class StrategyAnalytics:
                 "仅允许传入 1 至 2³¹−1 的整数 n_periods，价格列固定为 close",
                 capability=name,
             )
+        sessions = self._market.sessions(lookback_sessions=lookback_sessions)
         batch = self._market.history(instruments, lookback_sessions=lookback_sessions)
-        frame = pd.DataFrame(
+        instrument_by_ticker = {bar.ticker: bar.instrument_id for bar in batch.bars}
+        prices = pd.DataFrame(
             ((bar.session_date, bar.ticker, float(bar.close)) for bar in batch.bars),
             columns=["date", "ticker", "close"],
+        ).set_index(["date", "ticker"])
+        # 给每只证券保留交易日位置, 缺失端点仍为 NaN
+        calendar_index = pd.MultiIndex.from_product(
+            ([session.session_date for session in sessions], instrument_by_ticker),
+            names=prices.index.names,
         )
-        # 回看期超过可见日期数时，所有证券仍是缺值，限制底层 shift 分配
-        visible_days = len({bar.session_date for bar in batch.bars})
-        periods = min(n_periods, max(1, visible_days))
+        frame = prices.reindex(calendar_index).reset_index()
+        periods = min(n_periods, len(sessions))
         try:
             # 保留入口返回的对象身份，下游按此检查来源
             panel = self._adapter._prepare_panel(df=frame)
@@ -173,14 +189,14 @@ class StrategyAnalytics:
                 ErrorCode.TOOLKIT_FAILURE, f"{name} 计算失败", capability=name
             ) from exc
 
-        instrument_by_ticker = {bar.ticker: bar.instrument_id for bar in batch.bars}
+        observed_values = values.loc[panel["close"].notna()]
         points = tuple(
             FeaturePoint(
                 session_date.date(),
                 instrument_by_ticker[ticker],
                 None if pd.isna(value) else float(value),
             )
-            for (session_date, ticker), value in values.items()
+            for (session_date, ticker), value in observed_values.items()
         )
         return FeatureResult(
             name,

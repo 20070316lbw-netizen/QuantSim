@@ -1,3 +1,10 @@
+"""验证日频时钟及恢复
+
+test_clock_resumes_the_same_ticks_from_a_frozen_calendar 对照从头运行与恢复
+test_clock_for_an_empty_calendar_is_finished 检查空日历
+test_clock_rejects_invalid_advances_without_changing_its_position、test_clock_rejects_checkpoints_outside_the_calendar 和 test_clock_rejects_invalid_calendar_order_and_times 检查无效推进、检查点及日历
+"""
+
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 

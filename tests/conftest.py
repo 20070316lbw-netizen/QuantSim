@@ -1,3 +1,8 @@
+"""提供共享的测试环境
+
+market fixture 调用 initialize_database 创建临时库并返回 MarketDataRepository, 供各测试按需导入数据
+"""
+
 from pathlib import Path
 
 import pytest

@@ -1,4 +1,10 @@
-"""组装带时点与逐值来源的历史市场快照。"""
+"""构造具有逐值来源的时点市场快照
+
+validate_projection 校验快照层与字段, 由 MarketDataRepository.snapshot 调用
+read_snapshot 查询上市、证券池、行情及披露数据, 只返回指定 as_of 可见的记录
+read_snapshot 内的 lineage 创建来源信息, MarketSnapshotRow.field 按名称读取字段
+策略和撮合通过 MarketView.snapshot 间接消费这些结果
+"""
 
 from dataclasses import dataclass
 from datetime import date, datetime

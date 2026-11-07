@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python 3.12 / macOS
+    runs-on: macos-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: QuantSim
+    steps:
+      - name: 检出 QuantSim
+        uses: actions/checkout@v4
+        with:
+          path: QuantSim
+
+      - name: 检出固定版本的 QuantToolKit
+        uses: actions/checkout@v4
+        with:
+          repository: 20070316lbw-netizen/QuantToolKit
+          ref: b19c1969ce38f283677cc3dc5992f8df6d5dd8ad
+          path: quant/QuantToolKit
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.12.22'
+
+      - name: 安装 LightGBM 所需的 OpenMP
+        run: brew list libomp || brew install libomp
+
+      - name: 安装锁定依赖
+        run: uv sync --locked
+
+      - name: 检查代码
+        run: uv run --locked ruff check .
+
+      - name: 检查格式
+        run: uv run --locked ruff format --check .
+
+      - name: 运行测试
+        run: uv run --locked pytest -q

@@ -1,3 +1,14 @@
+"""验证 QuantToolKit 策略适配边界
+
+test_strategy_feature_reuses_toolkit_with_visible_market_data 对照可见行情和特征结果
+test_strategy_rejects_disabled_capabilities_and_invalid_parameters 检查能力及参数限制
+test_toolkit_public_price_contract_survives_adapter_integration 检查公开来源契约
+test_strategy_error_preserves_toolkit_source_rejection 检查异常链, 内部 copy_prepared_panel 模拟来源丢失
+test_feature_without_any_visible_bar_has_no_points 检查空行情结果
+test_historical_return_counts_sessions_with_missing_bars 检查缺行时的交易日期数
+"""
+
+import json
 from datetime import date, datetime
 from uuid import UUID
 
@@ -115,3 +126,31 @@ def test_feature_without_any_visible_bar_has_no_points(market):
     result = strategy.feature(FEATURE, (B,), lookback_sessions=2)
     assert result.points == ()
     assert result.requested_instruments == (B,)
+
+
+@pytest.mark.parametrize(("periods", "expected"), [(1, None), (2, 1.2)])
+def test_historical_return_counts_sessions_with_missing_bars(
+    market, tmp_path, periods, expected
+):
+    data = json.loads(FIXTURE.read_text())
+    data["bars"] = [
+        bar
+        for bar in data["bars"]
+        if (bar["instrument_key"], bar["session_date"]) != ("A", "2024-07-03")
+    ]
+    path = tmp_path / "missing.json"
+    path.write_text(json.dumps(data))
+    version = market.import_batch(path).data_version
+    strategy = QuantToolkitAdapter().for_strategy(
+        market=market.view(version, date(2024, 7, 5))
+    )
+    result = strategy.feature(
+        FEATURE, (A, B), lookback_sessions=3, params={"n_periods": periods}
+    )
+    points = [point for point in result.points if point.instrument_id == A]
+    assert [point.session_date for point in points] == [
+        date(2024, 7, 2),
+        date(2024, 7, 5),
+    ]
+    assert points[0].value is None
+    assert points[1].value == (None if expected is None else pytest.approx(expected))
