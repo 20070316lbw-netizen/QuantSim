@@ -3,7 +3,7 @@
 execute 校验订单、账户和配置, 通过 MarketView.snapshot 获取当日可见的原始行情
 函数按提交顺序检查场景、成交资格、容量和购买力, 返回成交或结束原因及预计算后的现金和持仓
 成交额和费用按账户货币单位半偶舍入, 输入状态不被修改
-portfolio.apply_fills 用成交生成现金流水及持仓, 由后续回放协调器负责提交
+portfolio.apply_fills 用成交生成现金流水及持仓, 由回放协调器负责提交
 """
 
 from dataclasses import dataclass
@@ -71,6 +71,20 @@ class ExecutionResult:
     positions: dict[UUID, int]
 
 
+def validate_execution_config(config: ExecutionConfig) -> None:
+    """校验容量、费率及货币单位, 创建回放时也使用同一约束"""
+    if (
+        not isinstance(config.participation_rate, Decimal)
+        or not config.participation_rate.is_finite()
+        or not 0 <= config.participation_rate <= 1
+        or not isinstance(config.fee_rate, Decimal)
+        or not config.fee_rate.is_finite()
+        or not 0 <= config.fee_rate <= 1
+        or not valid_currency_unit(config.currency_unit)
+    ):
+        raise SimulatorError(ErrorCode.INVALID_REQUEST, "撮合费率、容量或货币单位无效")
+
+
 def execute(
     tick: Tick,
     orders: tuple[Order, ...],
@@ -92,16 +106,7 @@ def execute(
         raise SimulatorError(
             ErrorCode.INCONSISTENT_STATE, "撮合行情视图须绑定当前 tick"
         )
-    if (
-        not isinstance(config.participation_rate, Decimal)
-        or not config.participation_rate.is_finite()
-        or not 0 <= config.participation_rate <= 1
-        or not isinstance(config.fee_rate, Decimal)
-        or not config.fee_rate.is_finite()
-        or not 0 <= config.fee_rate <= 1
-        or not valid_currency_unit(config.currency_unit)
-    ):
-        raise SimulatorError(ErrorCode.INVALID_REQUEST, "撮合费率、容量或货币单位无效")
+    validate_execution_config(config)
     validate_state(state)
     ids, keys = set(), set()
     for order in orders:

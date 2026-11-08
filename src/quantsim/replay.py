@@ -1,0 +1,690 @@
+"""逐日编排场景、撮合、账本与策略, 并保存可恢复的 DuckDB 检查点
+
+Replay.create 冻结运行配置并原子写入期初流水
+Replay.next_tick 查询下一待处理步骤, Replay.step 按显式序号提交或读回既有快照
+恢复只依赖数据库中的运行配置、检查点及已提交业务记录
+"""
+
+import json
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass
+from datetime import date, datetime
+from decimal import Decimal
+from hashlib import sha256
+from pathlib import Path
+from types import MappingProxyType
+from uuid import NAMESPACE_URL, UUID, uuid5
+
+import duckdb
+
+from quantsim import portfolio
+from quantsim._account import PortfolioState, account_context
+from quantsim.errors import ErrorCode, SimulatorError
+from quantsim.execution import (
+    ExecutionConfig,
+    Order,
+    OrderOutcome,
+    execute,
+    validate_execution_config,
+)
+from quantsim.market_data import MarketDataRepository, Tick
+from quantsim.portfolio import BookingResult, PortfolioSnapshot, PositionMark
+from quantsim.scenario import ScenarioEvent, ScenarioEventEngine, ScenarioState
+from quantsim.simulation_clock import SimulationClock
+from quantsim.strategy import FixedRoundTripStrategy, OrderIntent, StrategyContext
+
+_STRATEGY_NAME = "fixed_round_trip"
+_STRATEGY_VERSION = "1"
+_SCENARIO_VERSION = "halt_resume:1"
+
+
+@dataclass(frozen=True)
+class ReplaySpec:
+    simulation_id: UUID
+    data_version: str
+    start_session: date
+    end_session: date
+    initial_cash: Decimal
+    execution: ExecutionConfig
+    strategy: FixedRoundTripStrategy
+    toolkit_revision: str
+    lock_hash: str
+    scenario_events: tuple[ScenarioEvent, ...] = ()
+    seed: int = 0
+
+
+class Replay:
+    """从已初始化的数据库打开日频回放, 运行配置从持久化记录恢复"""
+
+    def __init__(self, path: Path, simulation_id: UUID) -> None:
+        if not isinstance(simulation_id, UUID):
+            raise SimulatorError(ErrorCode.INVALID_REQUEST, "运行 ID 须为 UUID")
+        self._path = path.resolve()
+        self._simulation_id = simulation_id
+        self._market = MarketDataRepository(self._path)
+        with _connection(self._path) as db:
+            row = db.execute(
+                """
+                SELECT s.data_version, s.start_session, s.end_session, s.initial_cash,
+                       s.execution_config, s.scenario_version, s.scenario_manifest,
+                       t.strategy_id, t.name, t.code_version, t.config
+                FROM simulations s JOIN strategies t USING (strategy_id)
+                WHERE s.simulation_id = ?
+                """,
+                [simulation_id],
+            ).fetchone()
+        if row is None:
+            raise SimulatorError(ErrorCode.INVALID_REQUEST, "找不到指定回放运行")
+        (
+            self._version,
+            start,
+            end,
+            self._initial_cash,
+            execution,
+            scenario_version,
+            events,
+            self._strategy_id,
+            name,
+            code_version,
+            strategy,
+        ) = row
+        if (scenario_version, name, code_version) != (
+            _SCENARIO_VERSION,
+            _STRATEGY_NAME,
+            _STRATEGY_VERSION,
+        ):
+            raise SimulatorError(ErrorCode.INCONSISTENT_STATE, "回放配置版本不受支持")
+        strategy = json.loads(strategy)
+        self._strategy = FixedRoundTripStrategy(
+            UUID(strategy["instrument_id"]), strategy["quantity"]
+        )
+        self._execution = ExecutionConfig(
+            **{key: Decimal(value) for key, value in json.loads(execution).items()}
+        )
+        self._events = tuple(
+            ScenarioEvent(
+                event["scenario_sequence"],
+                datetime.fromisoformat(event["effective_at"]),
+                datetime.fromisoformat(event["available_at"]),
+                event["action"],
+                UUID(event["instrument_id"]) if event["instrument_id"] else None,
+            )
+            for event in json.loads(events)
+        )
+        self._sessions = self._market.sessions(self._version, start, end)
+
+    @classmethod
+    def create(cls, path: Path, spec: ReplaySpec) -> "Replay":
+        """创建新运行, 区间须在冻结日历覆盖范围内且包含交易日
+
+        币种沿用数据包, 调用方须确认区间无公司行动
+        运行 ID 已存在时使用 Replay(path, id) 打开原运行
+        """
+        if (
+            not isinstance(spec.simulation_id, UUID)
+            or type(spec.start_session) is not date
+            or type(spec.end_session) is not date
+            or spec.start_session > spec.end_session
+            or not isinstance(spec.execution, ExecutionConfig)
+            or not isinstance(spec.scenario_events, tuple)
+            or type(spec.strategy) is not FixedRoundTripStrategy
+            or not isinstance(spec.strategy.instrument_id, UUID)
+            or spec.strategy.quantity >= 2**63
+            or type(spec.seed) is not int
+            or not -(2**63) <= spec.seed < 2**63
+            or not all(
+                isinstance(value, str) and value.strip()
+                for value in (spec.data_version, spec.toolkit_revision, spec.lock_hash)
+            )
+        ):
+            raise SimulatorError(ErrorCode.INVALID_REQUEST, "回放配置无效")
+        validate_execution_config(spec.execution)
+        _check_money((spec.execution.currency_unit,), ErrorCode.INVALID_REQUEST)
+        initial = portfolio.initialize(
+            spec.initial_cash, currency_unit=spec.execution.currency_unit
+        )
+        cash = initial.state.cash
+        _check_money((cash,), ErrorCode.INVALID_REQUEST)
+        calendar = MarketDataRepository(path).sessions(
+            spec.data_version, date.min, date.max
+        )
+        sessions = tuple(
+            day
+            for day in calendar
+            if spec.start_session <= day.session_date <= spec.end_session
+        )
+        if (
+            not sessions
+            or spec.start_session < calendar[0].session_date
+            or spec.end_session > calendar[-1].session_date
+        ):
+            raise SimulatorError(
+                ErrorCode.INVALID_REQUEST, "回放区间超出冻结日历或无交易日"
+            )
+        first = SimulationClock(sessions).peek()
+        assert first is not None
+        ScenarioEventEngine.apply(first, ScenarioState(), spec.scenario_events)
+        events = sorted(spec.scenario_events, key=lambda event: event.scenario_sequence)
+        strategy = _json(
+            {
+                "instrument_id": str(spec.strategy.instrument_id),
+                "quantity": spec.strategy.quantity,
+            }
+        )
+        definition = sha256(
+            _json([_STRATEGY_NAME, _STRATEGY_VERSION, strategy]).encode()
+        ).hexdigest()
+        strategy_id = uuid5(NAMESPACE_URL, f"quantsim:strategy:{definition}")
+
+        with _connection(path, write=True) as db:
+            if db.execute(
+                "SELECT 1 FROM simulations WHERE simulation_id = ?",
+                [spec.simulation_id],
+            ).fetchone():
+                raise SimulatorError(ErrorCode.INVALID_REQUEST, "回放运行 ID 已存在")
+            (manifest,) = db.execute(
+                "SELECT manifest FROM market_datasets WHERE data_version = ?",
+                [spec.data_version],
+            ).fetchone()
+            _check_instruments(
+                db,
+                spec.data_version,
+                {spec.strategy.instrument_id}
+                | {
+                    event.instrument_id
+                    for event in events
+                    if event.instrument_id is not None
+                },
+            )
+            db.execute(
+                """
+                INSERT INTO strategies (strategy_id, name, code_version, config, definition_hash)
+                VALUES (?, ?, ?, ?, ?) ON CONFLICT (definition_hash) DO NOTHING
+                """,
+                [strategy_id, _STRATEGY_NAME, _STRATEGY_VERSION, strategy, definition],
+            )
+            db.execute(
+                """
+                INSERT INTO simulations (
+                    simulation_id, strategy_id, data_version, data_manifest,
+                    scenario_version, scenario_manifest, start_session, end_session,
+                    currency, initial_cash, execution_config, seed, toolkit_revision, lock_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    spec.simulation_id,
+                    strategy_id,
+                    spec.data_version,
+                    manifest,
+                    _SCENARIO_VERSION,
+                    _json(
+                        [
+                            {
+                                **asdict(event),
+                                "instrument_id": str(event.instrument_id)
+                                if event.instrument_id
+                                else None,
+                                "effective_at": event.effective_at.isoformat(),
+                                "available_at": event.available_at.isoformat(),
+                            }
+                            for event in events
+                        ]
+                    ),
+                    spec.start_session,
+                    spec.end_session,
+                    json.loads(manifest)["currency"],
+                    str(cash),
+                    _json(
+                        {
+                            key: str(value)
+                            for key, value in asdict(spec.execution).items()
+                        }
+                    ),
+                    spec.seed,
+                    spec.toolkit_revision,
+                    spec.lock_hash,
+                ],
+            )
+            db.execute(
+                "INSERT INTO cash_ledger VALUES (?, 0, 0, NULL, 'initial', ?, ?)",
+                [spec.simulation_id, str(cash), first.market_close_at],
+            )
+            _insert_event(
+                db,
+                spec.simulation_id,
+                0,
+                1,
+                "run_started",
+                first,
+                "replay",
+                {"data_version": spec.data_version},
+            )
+        return cls(path, spec.simulation_id)
+
+    def next_tick(self) -> Tick | None:
+        """读取下一未提交 tick, 回放结束时返回 None"""
+        with _connection(self._path) as db:
+            committed = self._committed_seq(db)
+        return SimulationClock(self._sessions, committed_seq=committed).peek()
+
+    def step(self, tick_seq: int) -> PortfolioSnapshot:
+        """提交指定的下一 tick, 重试已提交的序号返回持久化快照
+
+        跳步或无效序号返回 INVALID_REQUEST, 数据库写入失败可重试同一序号
+        """
+        if type(tick_seq) is not int or not 1 <= tick_seq <= len(self._sessions):
+            raise SimulatorError(ErrorCode.INVALID_REQUEST, "tick 序号超出回放区间")
+        with _connection(self._path) as db:
+            committed = self._committed_seq(db)
+            if tick_seq <= committed:
+                return self._snapshot(db, tick_seq)
+            if tick_seq != committed + 1:
+                raise SimulatorError(ErrorCode.INVALID_REQUEST, "不能跳过未提交 tick")
+            orders = tuple(
+                Order(*row)
+                for row in db.execute(
+                    """
+                    SELECT order_id, instrument_id, side, quantity, submitted_tick,
+                           target_tick, intent_seq
+                    FROM orders WHERE simulation_id = ? AND target_tick = ?
+                    ORDER BY intent_seq
+                    """,
+                    [self._simulation_id, tick_seq],
+                ).fetchall()
+            )
+            previous = self._snapshot(db, committed) if committed else None
+
+        clock = SimulationClock(self._sessions, committed_seq=committed)
+        tick = clock.peek()
+        assert tick is not None
+        market = self._market.view(self._version, tick.session_date)
+        account = (
+            PortfolioState(
+                previous.cash, {p.instrument_id: p.quantity for p in previous.positions}
+            )
+            if previous
+            else PortfolioState(self._initial_cash, {})
+        )
+        limits, pending = ScenarioState(), self._events
+        if previous:
+            restored = ScenarioEventEngine.apply(previous.tick, limits, pending)
+            limits, pending = restored.state, restored.pending
+        scenario = ScenarioEventEngine.apply(tick, limits, pending)
+        execution = execute(
+            tick, orders, market, scenario.state, account, self._execution
+        )
+        fills = tuple(outcome.fill for outcome in execution.outcomes if outcome.fill)
+        for order, outcome in zip(orders, execution.outcomes, strict=True):
+            fill = outcome.fill
+            if outcome.order_id != order.order_id or (
+                fill is not None
+                and (
+                    (fill.order_id, fill.instrument_id, fill.side, fill.quantity)
+                    != (order.order_id, order.instrument_id, order.side, order.quantity)
+                    or (fill.data_version, fill.session_date, fill.executed_at)
+                    != (self._version, tick.session_date, tick.market_close_at)
+                    or order.target_tick != tick.seq
+                )
+            ):
+                raise SimulatorError(
+                    ErrorCode.INCONSISTENT_STATE, "成交与到期订单或 tick 不一致"
+                )
+        booked = portfolio.apply_fills(account, fills)
+        if booked.state != PortfolioState(
+            execution.cash,
+            {key: qty for key, qty in execution.positions.items() if qty},
+        ):
+            raise SimulatorError(
+                ErrorCode.INCONSISTENT_STATE, "过账结果与撮合状态不一致"
+            )
+        snapshot = portfolio.mark(
+            tick, booked.state, market, currency_unit=self._execution.currency_unit
+        )
+        _check_money(
+            (
+                snapshot.cash,
+                snapshot.equity,
+                *(p.market_value for p in snapshot.positions),
+                *(value for fill in fills for value in (fill.notional, fill.fee)),
+                *(entry.amount for entry in booked.entries),
+            ),
+            ErrorCode.INCONSISTENT_STATE,
+        )
+        finished = tick.seq == len(self._sessions)
+        intents = (
+            ()
+            if finished
+            else self._strategy.decide(
+                StrategyContext(
+                    tick,
+                    market,
+                    MappingProxyType(booked.state.positions),
+                    scenario.state,
+                )
+            )
+        )
+        if any(
+            not isinstance(intent, OrderIntent)
+            or not isinstance(intent.instrument_id, UUID)
+            or intent.side not in ("buy", "sell")
+            or type(intent.quantity) is not int
+            or not 0 < intent.quantity < 2**63
+            for intent in intents
+        ):
+            raise SimulatorError(ErrorCode.INVALID_REQUEST, "策略订单意图无效")
+        next_orders = tuple(
+            Order(
+                uuid5(self._simulation_id, f"order:{tick.seq}:{index}"),
+                intent.instrument_id,
+                intent.side,
+                intent.quantity,
+                tick.seq,
+                tick.seq + 1,
+                index,
+            )
+            for index, intent in enumerate(intents)
+        )
+
+        with _connection(self._path, write=True) as db:
+            current = self._committed_seq(db)
+            if tick_seq <= current:
+                return self._snapshot(db, tick_seq)
+            if current != committed:
+                raise SimulatorError(
+                    ErrorCode.INCONSISTENT_STATE, "提交前回放检查点发生变动"
+                )
+            _check_instruments(
+                db, self._version, {order.instrument_id for order in next_orders}
+            )
+            self._write_tick(
+                db,
+                snapshot,
+                scenario.applied,
+                orders,
+                execution.outcomes,
+                booked,
+                next_orders,
+                finished,
+            )
+        return snapshot
+
+    def _committed_seq(self, db: duckdb.DuckDBPyConnection) -> int:
+        (seq,) = db.execute(
+            """
+            SELECT coalesce(max(tick_seq), 0) FROM events
+            WHERE simulation_id = ? AND event_type = 'tick_committed' AND event_seq = 0
+            """,
+            [self._simulation_id],
+        ).fetchone()
+        return seq
+
+    def _snapshot(self, db: duckdb.DuckDBPyConnection, seq: int) -> PortfolioSnapshot:
+        row = db.execute(
+            """
+            SELECT payload FROM events WHERE simulation_id = ? AND tick_seq = ?
+            AND event_seq = 0 AND event_type = 'tick_committed'
+            """,
+            [self._simulation_id, seq],
+        ).fetchone()
+        if row is None:
+            raise SimulatorError(
+                ErrorCode.INCONSISTENT_STATE, f"缺少 tick {seq} 检查点"
+            )
+        day = self._sessions[seq - 1]
+        tick = Tick(day.session_date, day.market_close_at, day.cutoff_at, seq)
+        checkpoint = json.loads(row[0])
+        if (checkpoint["session_date"], checkpoint["data_version"]) != (
+            tick.session_date.isoformat(),
+            self._version,
+        ):
+            raise SimulatorError(
+                ErrorCode.INCONSISTENT_STATE, "检查点的日期或行情版本不一致"
+            )
+        positions = tuple(
+            PositionMark(*position)
+            for position in db.execute(
+                """
+                SELECT p.instrument_id, p.quantity, p.mark_session, p.mark_price,
+                       p.market_value, b.source_ref, p.stale
+                FROM positions_daily p JOIN market_bars b
+                  ON (p.data_version, p.instrument_id, p.mark_session)
+                   = (b.data_version, b.instrument_id, b.session_date)
+                WHERE p.simulation_id = ? AND p.tick_seq = ? ORDER BY p.instrument_id
+                """,
+                [self._simulation_id, seq],
+            ).fetchall()
+        )
+        return PortfolioSnapshot(
+            tick,
+            self._version,
+            Decimal(checkpoint["cash"]),
+            positions,
+            Decimal(checkpoint["equity"]),
+        )
+
+    def _write_tick(
+        self,
+        db: duckdb.DuckDBPyConnection,
+        snapshot: PortfolioSnapshot,
+        events: tuple[ScenarioEvent, ...],
+        orders: tuple[Order, ...],
+        outcomes: tuple[OrderOutcome, ...],
+        booked: BookingResult,
+        next_orders: tuple[Order, ...],
+        finished: bool,
+    ) -> None:
+        run, tick = self._simulation_id, snapshot.tick
+        event_seq = 1
+        for event in events:
+            _insert_event(
+                db,
+                run,
+                tick.seq,
+                event_seq,
+                "scenario_applied",
+                tick,
+                f"scenario:{event.scenario_sequence}",
+                {"scenario_sequence": event.scenario_sequence, "action": event.action},
+                instrument_id=event.instrument_id,
+                times=(event.effective_at, event.available_at),
+            )
+            event_seq += 1
+        entries = iter(booked.entries)
+        for order, outcome in zip(orders, outcomes, strict=True):
+            fill = outcome.fill
+            source = "execution"
+            if fill:
+                source = fill.bar_source_ref
+                fill_id = uuid5(run, f"fill:{order.order_id}")
+                db.execute(
+                    """
+                    INSERT INTO fills VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        fill_id,
+                        run,
+                        order.order_id,
+                        fill.instrument_id,
+                        fill.data_version,
+                        fill.session_date,
+                        tick.seq,
+                        fill.executed_at,
+                        fill.quantity,
+                        fill.price,
+                        fill.price,
+                        str(fill.notional),
+                        str(fill.fee),
+                    ],
+                )
+                entry = next(entries)
+                db.execute(
+                    "INSERT INTO cash_ledger VALUES (?, ?, ?, ?, 'trade', ?, ?)",
+                    [
+                        run,
+                        tick.seq,
+                        order.intent_seq,
+                        fill_id,
+                        str(entry.amount),
+                        tick.market_close_at,
+                    ],
+                )
+            _insert_event(
+                db,
+                run,
+                tick.seq,
+                event_seq,
+                "order_closed",
+                tick,
+                source,
+                {"reason": outcome.reason},
+                order_id=order.order_id,
+                instrument_id=order.instrument_id,
+            )
+            event_seq += 1
+        for position in snapshot.positions:
+            db.execute(
+                "INSERT INTO positions_daily VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    run,
+                    tick.session_date,
+                    position.instrument_id,
+                    tick.seq,
+                    self._version,
+                    position.mark_session,
+                    position.quantity,
+                    position.mark_price,
+                    str(position.market_value),
+                    position.stale,
+                    tick.market_close_at,
+                ],
+            )
+        for order in next_orders:
+            db.execute(
+                """
+                INSERT INTO orders VALUES (?, ?, ?, ?, 'strategy', ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    order.order_id,
+                    run,
+                    self._strategy_id,
+                    order.instrument_id,
+                    order.side,
+                    order.quantity,
+                    order.submitted_tick,
+                    tick.cutoff_at,
+                    order.intent_seq,
+                    order.target_tick,
+                ],
+            )
+            _insert_event(
+                db,
+                run,
+                tick.seq,
+                event_seq,
+                "order_submitted",
+                tick,
+                "strategy",
+                {"target_tick": order.target_tick},
+                order_id=order.order_id,
+                instrument_id=order.instrument_id,
+                times=(tick.cutoff_at, tick.cutoff_at),
+            )
+            event_seq += 1
+        if finished:
+            _insert_event(
+                db, run, tick.seq, event_seq, "run_finished", tick, "replay", {}
+            )
+        _insert_event(
+            db,
+            run,
+            tick.seq,
+            0,
+            "tick_committed",
+            tick,
+            "replay",
+            {
+                "session_date": tick.session_date.isoformat(),
+                "data_version": self._version,
+                "cash": str(snapshot.cash),
+                "equity": str(snapshot.equity),
+            },
+        )
+
+
+@contextmanager
+def _connection(
+    path: Path, *, write: bool = False
+) -> Iterator[duckdb.DuckDBPyConnection]:
+    try:
+        with duckdb.connect(path, read_only=not write) as db:
+            db.begin()
+            yield db
+            db.commit()
+    except duckdb.Error as exc:
+        raise SimulatorError(ErrorCode.DATA_UNAVAILABLE, "回放数据库读写失败") from exc
+
+
+def _check_instruments(
+    db: duckdb.DuckDBPyConnection, version: str, instruments: set[UUID]
+) -> None:
+    if not instruments:
+        return
+    rows = db.execute(
+        "SELECT instrument_id FROM market_listings WHERE data_version = ? AND instrument_id IN (SELECT unnest(?))",
+        [version, sorted(instruments)],
+    ).fetchall()
+    if {row[0] for row in rows} != instruments:
+        raise SimulatorError(
+            ErrorCode.INVALID_REQUEST, "场景或订单证券不属于冻结行情版本"
+        )
+
+
+def _check_money(values: tuple[Decimal, ...], code: ErrorCode) -> None:
+    with account_context():
+        if any(
+            abs(value) >= 10**16 or value != value.quantize(Decimal("0.00000001"))
+            for value in values
+        ):
+            raise SimulatorError(
+                code, "账户金额或货币单位超出数据库 DECIMAL(24,8) 精度"
+            )
+
+
+def _insert_event(
+    db: duckdb.DuckDBPyConnection,
+    run: UUID,
+    tick_seq: int,
+    event_seq: int,
+    event_type: str,
+    tick: Tick,
+    source: str,
+    payload: dict,
+    *,
+    order_id: UUID | None = None,
+    instrument_id: UUID | None = None,
+    times: tuple[datetime, datetime] | None = None,
+) -> None:
+    db.execute(
+        """
+        INSERT INTO events (
+            simulation_id, tick_seq, event_seq, event_type, order_id, instrument_id,
+            effective_at, available_at, source_ref, payload
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            run,
+            tick_seq,
+            event_seq,
+            event_type,
+            order_id,
+            instrument_id,
+            *(times or (tick.market_close_at, tick.cutoff_at)),
+            source,
+            _json(payload),
+        ],
+    )
+
+
+def _json(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))

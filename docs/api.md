@@ -6,7 +6,7 @@
 
 | 类型 | 字段及约束 |
 | --- | --- |
-| `ReplaySpec` | `simulation_id`、冻结 `data_version`、场景及策略版本、回放日期区间、初始权益、币种、执行参数、种子 |
+| `ReplaySpec` | `simulation_id`、冻结 `data_version`、场景事件、固定策略、回放日期区间、期初现金、执行参数、Toolkit 修订、锁文件摘要和种子。运行记录从行情清单取得币种 |
 | `Session` / `Tick` | `session_date: date` 为交易所当地交易日，`market_close_at`、`cutoff_at` 为带时区 UTC 时刻。Tick 加 `seq: int`，从 1 开始 |
 | `Bar` / `BarBatch` | 证券 ID、交易日、`bar_end_at`、`available_at`、原始 OHLC、成交量、可交易状态及来源。批次加 `data_version`、`as_of` |
 | `MarketView` | 按当前 `as_of` 截断的历史查询对象。只暴露有效证券和过去已发布的数据，包括当日已发布 bar |
@@ -72,7 +72,7 @@ class SimulationClock:
 
 用 `market.sessions(data_version, start, end)` 取得冻结版本在回放区间内的交易日历，再构造 [SimulationClock](../src/quantsim/simulation_clock.py)。交易日、UTC 收盘时刻和 UTC cutoff 各自严格递增，且 cutoff 不早于对应收盘。序号从区间首个交易日的 1 开始，假期和周末由日历决定。
 
-`peek()` 重复读取返回同一个待提交 tick，空区间或最后一日提交后返回 `None`。协调器完成持久化后调用 `advance(tick.seq)`。跳号、重复、回退及结束后推进会抛出 `INCONSISTENT_STATE`，时钟位置保持原值。恢复时用同一版本和日期区间构造时钟，并传入最后一个已提交序号。`committed_seq=0` 表示尚未提交，超过日历长度或非法日历会抛出 `INVALID_REQUEST`。
+`peek()` 重复读取返回同一个待提交 tick，空区间或最后一日提交后返回 `None`。协调器以持久化检查点的序号构造时钟。单独维护时钟的调用方可在成功提交后调用 `advance(tick.seq)`。跳号、重复、回退及结束后推进会抛出 `INCONSISTENT_STATE`，时钟位置保持原值。恢复时用同一版本和日期区间构造时钟，并传入最后一个已提交序号。`committed_seq=0` 表示尚未提交，超过日历长度或非法日历会抛出 `INVALID_REQUEST`。
 
 ## ScenarioEventEngine
 
@@ -127,7 +127,24 @@ def mark(
 
 `apply_fills` 接收当期撮合产出的有序成交，使用已舍入的成交额和费用。买入净流水为 `-(成交额 + 费用)`，卖出为 `成交额 - 费用`，清仓后移除零股持仓。批内重复订单、过账字段无效或任一笔成交后现金或股数为负，均返回 `INCONSISTENT_STATE`，输入状态可用于重算。协调器负责在提交时验证成交与订单、运行版本及 tick 的对应关系，并按检查点防止重复过账。
 
-`mark` 使用与 tick 绑定的视图，按证券 ID 顺序返回非零持仓的估值。优先使用当日可见原始 close，缺价时用当前 cutoff 下最近的历史原始 close 并标记 `stale`。可见的零量或不可成交 bar 仍可用于估值。快照保存数据版本、标记价日期和原始 bar 引用，任一持仓缺少可见原始价时返回 `DATA_UNAVAILABLE`。日终权益为现金加各证券分别舍入后的市值，空仓日权益等于现金。货币单位与 `ExecutionConfig.currency_unit` 一致。账本与快照的持久化由回放协调器接入。
+`mark` 使用与 tick 绑定的视图，按证券 ID 顺序返回非零持仓的估值。优先使用当日可见原始 close，缺价时用当前 cutoff 下最近的历史原始 close 并标记 `stale`。可见的零量或不可成交 bar 仍可用于估值。快照保存数据版本、标记价日期和原始 bar 引用，任一持仓缺少可见原始价时返回 `DATA_UNAVAILABLE`。日终权益为现金加各证券分别舍入后的市值，空仓日权益等于现金。货币单位与 `ExecutionConfig.currency_unit` 一致。账本与快照随 tick 一起由回放协调器持久化。
+
+## Replay
+
+```python
+class Replay:
+    def __init__(self, path: Path, simulation_id: UUID) -> None: ...
+    @classmethod
+    def create(cls, path: Path, spec: ReplaySpec) -> Replay: ...
+    def next_tick(self) -> Tick | None: ...
+    def step(self, tick_seq: int) -> PortfolioSnapshot: ...
+```
+
+[回放入口](../src/quantsim/replay.py) 使用已初始化、已导入行情的 DuckDB 文件。创建运行时固定数据版本、日期、执行参数、`FixedRoundTripStrategy`、halt / resume 事件和依赖标识，并原子写入初始现金流水。调用者提供唯一 UUID 和依赖标识，确认回放区间无公司行动。币种来自冻结数据包。日期区间须在冻结日历首末日期内且包含交易日，货币单位及账户金额须能以 `DECIMAL(24,8)` 精确保存。创建时如 ID 已存在，使用构造函数打开既有运行。
+
+`next_tick()` 从数据库查询下一未提交 tick，最后一日提交后返回 `None`。`step(seq)` 要求指定下一未提交序号或任一已提交序号。前者按场景、撮合、过账、估值和决策的顺序执行，最后一日处理到期单后结束。后者直接读取持久化快照。非法序号和跳步返回 `INVALID_REQUEST`。策略意图只在结构有效且证券属于冻结批次时接受。
+
+每一步的订单、成交、净流水、日终非零持仓、事件与检查点在同一事务提交。中断后可按运行 ID 打开数据库并继续。数据库写入失败返回 `DATA_UNAVAILABLE`，可重试原序号。当前按单进程串行写入的约定运行。完整调用见 [三日离线示例](../examples/replay_round_trip.py)。
 
 ## QuantToolkitAdapter
 
@@ -165,4 +182,4 @@ def report(
 
 `historical_return` 是当前启用的策略特征。`params` 为映射，可包含 `n_periods`，默认 5，范围为 1 至 2³¹−1。Adapter 按冻结日历向前数 `n_periods` 个交易日，用两端在当前 MarketView 的 cutoff 前已发布的原始 `close` 计算，含恰在 cutoff 发布的行情。起点超出 `lookback_sessions` 或缺价时，当前观察的收益为 `None`。中间交易日即使缺行也计入期数，只要两端价格都可见就可以计算。输出只包含实际可见的行情观察，并保留请求证券、截止时点及批次 ID。
 
-`capabilities` 与 `describe` 可查看 Toolkit 目录。Toolkit 的当前计算入口为 `for_strategy` 所提供的特征。日频回放组件可分别调用，当前覆盖时钟、场景、固定策略、撮合及账户账本。其余接口按实施计划加入。
+`capabilities` 与 `describe` 可查看 Toolkit 目录。Toolkit 的当前计算入口为 `for_strategy` 所提供的特征。日频回放组件可分别调用，也可以通过 `Replay` 统一执行和恢复。绩效和报告接口按实施计划加入。

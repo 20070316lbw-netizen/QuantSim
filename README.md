@@ -4,7 +4,7 @@
 
 ![Assisted by Codex](assets/assisted-by-codex.svg)
 
-运行于 macOS 本机的量化交易回放模拟器。当前可在 DuckDB 导入冻结日频行情，查询带历史证券池、披露时点和逐值来源的市场快照，并运行第一项 QuantToolKit 策略特征。见 [历史市场导入与查询示例](docs/historical_market.md) 和 [开发流程说明书](docs/development_guide.md)。M0–M5 的早期技术拆解与交付记录见 [实施计划](docs/implementation_plan.md)。
+运行于 macOS 本机的量化交易回放模拟器。当前可在 DuckDB 导入冻结日频行情，查询带历史证券池、披露时点和逐值来源的市场快照，运行第一项 QuantToolKit 策略特征，也可以逐日回放固定策略并从已提交的账本续跑。见 [历史市场导入与查询示例](docs/historical_market.md) 和 [开发流程说明书](docs/development_guide.md)。M0–M5 的早期技术拆解与交付记录见 [实施计划](docs/implementation_plan.md)。
 
 ## 安装与测试
 
@@ -18,6 +18,23 @@ uv run --locked pytest -q
 QuantToolKit 从相对于项目目录的 `../quant/QuantToolKit` 以可编辑模式安装。修改其中的 Python 源码后，新启动的 QuantSim 进程会直接加载修改后的代码。首次安装需要准备该本机目录，其他依赖按 `uv.lock` 安装。下面的示例和测试使用本地 fixture。
 
 推送和提交 Pull Request 时，GitHub Actions 在 macOS 上安装锁定依赖并运行 Ruff 与测试。CI 将 QuantToolKit 检出到相同的相对路径，固定版本写在 [CI workflow](.github/workflows/ci.yml) 中；更新 Toolkit 依赖时需要同时核对该版本和 `uv.lock`。
+
+## 运行三日回放
+
+在项目目录运行离线示例。它在临时 DuckDB 中导入三日合成行情，从 1,000 USD 开始，按 10 bp 费率模拟买入 10 股和清仓。
+
+```sh
+uv run --locked python examples/replay_round_trip.py
+```
+
+```text
+交易日  现金  股数  权益
+2024-07-02  1000.00  0  1000.00
+2024-07-03  889.89  10  999.89
+2024-07-05  1009.77  0  1009.77
+```
+
+需要保留运行时，使用自己的数据库路径。重新打开 `Replay(path, simulation_id)`，用 `next_tick()` 查询待处理步骤。重复调用 `step(seq)` 会读回该步已提交的快照。见 [回放接口](docs/api.md#replay)。
 
 ## 运行一条特征
 

@@ -46,8 +46,8 @@ QuantSim 使用独立本地数据库。初期由单个回放进程串行写入�
 ## 索引、事务与校验
 
 - 每表的 PK、UNIQUE、FK 使用 DuckDB 的约束索引。首版无手工 ART 索引。行情导入按 `(data_version, instrument_id, session_date)` 批内排序，让读取证券日期范围时可利用 zonemap。回放按 `simulation_id` 和 tick 范围读取，实际查询要用 `ORDER BY`。初期数据量增长后先看查询计划，再考虑单列高选择性索引。 [DuckDB 约束](https://duckdb.org/docs/current/sql/constraints) [DuckDB 索引](https://duckdb.org/docs/current/sql/indexes) [索引选择](https://duckdb.org/docs/guides/performance/indexing)
-- 建立运行时，在同一事务写 `simulations`、tick 0 的初始现金流水和启动事件。每次 tick 在一个事务中写下一 tick 的订单、当期成交、现金、持仓、事件与最后一条 `tick_committed`。检查点约定 `event_seq=0`，业务事件序号从 1 起。检查点最后插入，payload 保存 session、权益、现金和版本引用，金额用精确十进制文本表示。按业务事件排序后应用检查点。空仓日仍有权益快照。
-- 状态从最新完整检查点、相关持仓和事件派生。运行结束事件跟最后一个检查点同事务写入，失败诊断在回滚后独立记录，重试以已提交检查点判断。相同内容重试可确认已有提交。遇到相同业务键而内容不一致则停止。未成交订单从提交事件和终态推导。结果表按终态插入，外部图表文件按内容摘要保存，只有成功入库的结果引用有效产物。
+- 建立运行时，在同一事务写 `simulations`、tick 0 的初始现金流水和启动事件。每次 tick 在一个事务中写下一 tick 的订单、当期成交、现金、持仓、事件与最后一条 `tick_committed`。检查点约定 `event_seq=0`，业务事件序号从 1 起。检查点最后插入，payload 保存 `session_date`、`equity`、`cash` 和 `data_version`，金额用精确十进制文本表示。查询同日业务事件按 `event_seq` 排序。空仓日仍有权益快照。
+- 状态从最新完整检查点、相关持仓和事件派生。运行结束事件跟最后一个检查点同事务写入，失败异常传给调用者，业务数据回滚。用同一运行和 tick 序号重试时，若检查点已提交则直接读回该快照。恢复以检查点现金和日终持仓为账户状态，从订单的目标 tick 读取下一批到期订单，并按上一检查点的时间和冻结场景输入重建交易限制。结果表按终态插入，外部图表文件按内容摘要保存，只有成功入库的结果引用有效产物。
 - 应用层校验 DDL 无法表达的关系，包括 `fill.tick_seq = order.target_tick`，完整成交数量与订单一致，同一 tick 中成交 bar 已可见，正量、场景可交易，账本金额与成交方向及费用一致。持仓快照须与当日现金和所有已提交成交守恒。实验与模拟关联还须核对日期区间、币种、版本和冻结参数。
 - 保留历史运行供复现，冻结表采用追加策略。迁移、重建或清理使用显式维护流程与备份。阶段推进及验证见 [implementation_plan.md](implementation_plan.md)。
 
