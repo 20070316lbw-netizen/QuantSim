@@ -1,4 +1,48 @@
-# QuantSim 独立验收 · M4-01 波动率与合成调仓
+# QuantSim 独立验收 · M4-02 基准与统计
+
+## 验收对象
+
+HEAD `d3843371bdc7724043e20a2350c7ac80dd580057` 加本轮工作区改动。开发方实测 104 项 pytest 通过，其中回放与动量两组 21 项。Ruff、格式和差异检查通过。Python 3.12.13、uv 0.12.22、DuckDB 2.0.0、pandas 3.1.1，QuantToolKit 为干净的 `b19c1969ce38f283677cc3dc5992f8df6d5dd8ad`。
+
+使用一次性副本和离线合成行情。用 `git rev-parse HEAD`、`git status --short`、`shasum -a 256` 与实际导入路径核对快照。源码与依赖只读，脚本、数据库、报告及缓存写到分配的临时目录。
+
+| 业务文件 | SHA-256 |
+| --- | --- |
+| `src/quantsim/performance.py` | `57083985f1c99ed37da5c5bd94cba2d6bf38aee5417d8da41f6c85302dd3bd44` |
+| `src/quantsim/replay.py` | `0d22b3069fffa0214d246ed4e08939c69c6eb4ce0b37cdefcce9e87a23d2352f` |
+| `src/quantsim/toolkit_adapter.py` | `d97a5da3095fa335227e867e8811ea98bdbe25314c3e942fa33cf656eefddd63` |
+| `tests/test_replay.py` | `2215db55a744940849df579a386f2e3bc0773621a443186591ebbd6420400b77` |
+| `tests/test_momentum_replay.py` | `b63dec4bbf6ec045ac0a472ebadee7e9d328ca7bbb0cb364964b2ad440e77ff5` |
+| `examples/replay_round_trip.py` | `45ed82e58249877e3cfe00225b960a6d9a4b1b37d1e8379b356f0a15a9a2119a` |
+| `uv.lock` | `1c2748ca39bdb32ef6e4aa119e99c6cbf5ab03ed985ee8b4104cccdce4ec88bf` |
+
+## 复现命令
+
+```sh
+export MPLBACKEND=Agg MPLCONFIGDIR="$TMPDIR/mpl"
+uv --no-cache run --locked --no-sync python -m pytest -q
+uv --no-cache run --locked --no-sync ruff check .
+uv --no-cache run --locked --no-sync ruff format --check .
+git diff --check
+uv --no-cache run --locked --no-sync python examples/replay_round_trip.py --report "$TMPDIR/replay.png"
+```
+
+## 通过条件
+
+1. **账本到指标。** 用公开 Replay 入口运行三日样本，并独立手算策略收益 `[0, -0.11/1000, 9.88/999.89]`。确认三日权益 1000.00、999.89、1009.77 USD，总费 0.23 USD。累计收益 0.977%，最大回撤 −0.011%，胜率 1/3，夏普为日收益均值除以样本标准差。打开旧式三日运行或在中途重新打开同一库，统计应与已提交前缀一致，重复读取不会推进。空运行无指标，一日策略夏普未定义。
+2. **固定份额基准。** 用三日样本确认首日无收益，之后为 `11/10 - 1`、`12/11 - 1`，累计 20%。再用两证券动量样本 A=`[10,10,12,12,11,11]`、B=`[10,10,10,10,16,16]` 验证基准累计 35%。将 B 的第三日 bar 改为第六日才可见，确认第三、四日基准收益缺失，缺价日期保留，基准区间指标未定义，策略统计仍可读。首日缺一只证券时整段基准未建仓。
+3. **报告及异常。** 核对净值与回撤图在离线样本实际生成，净值图策略终点为 1.00977、基准终点为 1.2。报告保存失败后，已提交结果仍可重新生成。删除中间检查点后，绩效必须报 `INCONSISTENT_STATE`，不得跨断档计算。
+
+请至少另做一次独立的公开接口复现，与测试及三日命令输出区分。记录实际命令和数值。报告不覆盖真实数据、公司行动、长区间性能或 M4-03 的报告索引持久化。
+
+## 验收结果
+
+DeepSeek 独立复验通过。首次模型会话完成 104 项全量测试、21 项局部测试、Ruff、出图和独立脚本，生成结论前超时。同一副本复验核对了七项摘要，重新执行独立脚本及示例，输出与首次复现一致，无阻断项。报告摘要见 [开发指南](../development_guide.md#m4-策略与绩效)。
+
+<!-- acceptance-history -->
+
+<details>
+<summary>M4-01 波动率与合成调仓验收记录</summary>
 
 ## 验收对象
 
@@ -32,6 +76,8 @@ uv --no-cache run --locked --no-sync python examples/replay_round_trip.py
 3. **配置和恢复。** 动量版本 1 仍按旧配置恢复，合成策略保存版本 2 与 `volatility_window=2`，重新打开运行后继续按合成分数决策。请核对实际结果与持久化字段。M3 离线回放最终权益仍为 1,009.77 USD。
 
 请记录逐项命令、实际数值和阻断项。需要自动解析时，最终给出单个 JSON 对象，使用启动提示中的字段。
+
+</details>
 
 ---
 

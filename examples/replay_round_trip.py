@@ -1,5 +1,6 @@
-"""从固定三日行情运行一次离线回放, 输出每个交易日的现金、股数和权益"""
+"""从固定三日行情运行离线回放, 可同时输出绩效和净值报告"""
 
+from argparse import ArgumentParser
 from datetime import date
 from decimal import Decimal
 from hashlib import sha256
@@ -15,6 +16,9 @@ from quantsim.strategy import FixedRoundTripStrategy
 
 
 def main() -> None:
+    parser = ArgumentParser(description=__doc__)
+    parser.add_argument("--report", type=Path, help="保存净值和回撤图的路径")
+    args = parser.parse_args()
     directory = Path(__file__).resolve().parent
     lock_hash = sha256((directory.parent / "uv.lock").read_bytes()).hexdigest()
     with TemporaryDirectory() as temp:
@@ -31,7 +35,7 @@ def main() -> None:
                 initial_cash=Decimal(1000),
                 execution=ExecutionConfig(Decimal(1), Decimal("0.001")),
                 strategy=FixedRoundTripStrategy(UUID(int=1), 10),
-                toolkit_revision="not_used",
+                toolkit_revision="local" if args.report else "not_used",
                 lock_hash=lock_hash,
             ),
         )
@@ -42,6 +46,16 @@ def main() -> None:
             print(
                 f"{tick.session_date}  {snapshot.cash:.2f}  {shares}  {snapshot.equity:.2f}"
             )
+        if args.report:
+            from matplotlib import pyplot as plt
+
+            result = run.performance()
+            print(f"策略累计收益 {result.portfolio.total_return:.3%}")
+            print(f"等权持有累计收益 {result.benchmark.total_return:.3%}")
+            print(f"累计成交费用 {result.total_fees:.2f} {result.currency}")
+            figure = run.report(output=args.report)
+            plt.close(figure)
+            print(f"回放报告 {args.report}")
 
 
 if __name__ == "__main__":

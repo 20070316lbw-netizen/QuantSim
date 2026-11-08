@@ -8,6 +8,7 @@ from dataclasses import replace
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
+from statistics import mean, stdev
 from uuid import UUID, uuid4
 
 import duckdb
@@ -137,6 +138,91 @@ def test_transaction_retry_and_resume(replay_inputs, monkeypatch):
         assert db.execute(
             "SELECT count(*) FROM events WHERE event_type = 'tick_committed'"
         ).fetchone() == (3,)
+
+
+def test_performance_from_committed_equity_and_fills(replay_inputs):
+    path, spec = replay_inputs
+    run = Replay.create(path, spec)
+    empty = run.performance()
+    assert (empty.complete, empty.days, empty.total_fees) == (False, (), Decimal(0))
+    assert empty.portfolio.total_return is None
+    with pytest.raises(SimulatorError) as error:
+        run.report()
+    assert error.value.code == ErrorCode.DATA_UNAVAILABLE
+
+    run.step(1)
+    partial = run.performance()
+    assert not partial.complete
+    assert partial.portfolio.total_return == 0
+    assert partial.portfolio.sharpe is None
+    assert partial.benchmark.total_return is None
+    assert partial.days[0].benchmark_return is None
+    assert run.next_tick().seq == 2
+    run.step(2)
+    run.step(3)
+    result = Replay(path, spec.simulation_id).performance()
+    assert result.complete
+    assert (result.initial_equity, result.currency, result.total_fees) == (
+        Decimal(1000),
+        "USD",
+        Decimal("0.23"),
+    )
+    assert [day.equity for day in result.days] == [
+        Decimal(1000),
+        Decimal("999.89"),
+        Decimal("1009.77"),
+    ]
+    assert [day.fees for day in result.days] == [
+        Decimal(0),
+        Decimal("0.11"),
+        Decimal("0.12"),
+    ]
+    daily = [0, -0.11 / 1000, 9.88 / 999.89]
+    assert [day.portfolio_return for day in result.days] == pytest.approx(daily)
+    assert result.portfolio.total_return == pytest.approx(0.00977)
+    assert result.portfolio.max_drawdown == pytest.approx(daily[1])
+    assert result.portfolio.sharpe == pytest.approx(mean(daily) / stdev(daily))
+    assert result.portfolio.win_rate == pytest.approx(1 / 3)
+    assert result.benchmark.total_return == pytest.approx(0.2)
+    assert result.benchmark_missing_sessions == ()
+    assert run.performance() == result
+
+
+def test_report_renders_equity_and_benchmark(replay_inputs, tmp_path, monkeypatch):
+    monkeypatch.setenv("MPLBACKEND", "Agg")
+    monkeypatch.setenv("MPLCONFIGDIR", str(tmp_path))
+    from matplotlib import pyplot as plt
+
+    path, spec = replay_inputs
+    run = Replay.create(path, spec)
+    for seq in (1, 2, 3):
+        run.step(seq)
+    output = tmp_path / "report.png"
+    figure = run.report(output=output)
+    try:
+        nav, drawdown = figure.axes
+        assert nav.lines[0].get_ydata() == pytest.approx([1, 0.99989, 1.00977])
+        assert nav.lines[-1].get_ydata() == pytest.approx([1, 1.1, 1.2])
+        assert drawdown.lines[0].get_ydata() == pytest.approx([0, -0.00011, 0])
+        assert output.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    finally:
+        plt.close(figure)
+    with pytest.raises(SimulatorError) as error:
+        run.report(output=tmp_path / "missing" / "report.png")
+    assert error.value.code == ErrorCode.DATA_UNAVAILABLE
+    assert run.next_tick() is None
+
+
+def test_performance_rejects_a_gap_in_checkpoints(replay_inputs):
+    path, spec = replay_inputs
+    run = Replay.create(path, spec)
+    for seq in (1, 2, 3):
+        run.step(seq)
+    with duckdb.connect(path) as db:
+        db.execute("DELETE FROM events WHERE tick_seq = 2 AND event_seq = 0")
+    with pytest.raises(SimulatorError, match="检查点不连续") as error:
+        run.performance()
+    assert error.value.code == ErrorCode.INCONSISTENT_STATE
 
 
 def test_late_bar_closes_order_without_later_fill(replay_inputs, tmp_path):

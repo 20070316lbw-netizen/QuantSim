@@ -155,6 +155,15 @@ class Replay:
     def create(cls, path: Path, spec: ReplaySpec) -> Replay: ...
     def next_tick(self) -> Tick | None: ...
     def step(self, tick_seq: int) -> PortfolioSnapshot: ...
+    def performance(
+        self, *, benchmark_instruments: tuple[UUID, ...] | None = None
+    ) -> PerformanceResult: ...
+    def report(
+        self,
+        *,
+        benchmark_instruments: tuple[UUID, ...] | None = None,
+        output: Path | None = None,
+    ) -> Figure: ...
 ```
 
 [回放入口](../src/quantsim/replay.py) 使用已初始化、已导入行情的 DuckDB 文件。创建运行时固定数据版本、日期、执行参数、策略及其版本、halt / resume 事件和依赖标识，并原子写入初始现金流水。支持 `FixedRoundTripStrategy` 和 `MomentumRotationStrategy`，打开既有运行时从已保存配置恢复策略。调用者提供唯一 UUID 和依赖标识，确认回放区间无公司行动。币种来自冻结数据包。日期区间须在冻结日历首末日期内且包含交易日，货币单位及账户金额须能以 `DECIMAL(24,8)` 精确保存。创建时如 ID 已存在，使用构造函数打开既有运行。
@@ -162,6 +171,16 @@ class Replay:
 `next_tick()` 从数据库查询下一未提交 tick，最后一日提交后返回 `None`。`step(seq)` 要求指定下一未提交序号或任一已提交序号。前者按场景、撮合、过账、估值和决策的顺序执行，最后一日处理到期单后结束。后者直接读取持久化快照。非法序号和跳步返回 `INVALID_REQUEST`。策略意图只在结构有效且证券属于冻结批次时接受。
 
 每一步的订单、成交、净流水、日终非零持仓、事件与检查点在同一事务提交。中断后可按运行 ID 打开数据库并继续。数据库写入失败返回 `DATA_UNAVAILABLE`，可重试原序号。当前按单进程串行写入的约定运行。完整调用见 [三日离线示例](../examples/replay_round_trip.py)。
+
+### 回放绩效与报告
+
+`performance()` 在同一读取事务取得检查点及各 tick 的成交费用。结果包含运行 ID、行情版本、币种、期初权益、总费用、`complete` 和按冻结日历排列的 `days`。未完成的运行只统计连续的已提交前缀。零提交返回空日序列及未定义指标，日期、版本、金额异常或检查点断档返回 `INCONSISTENT_STATE`。
+
+- **策略收益。** 第一日以前置期初权益为分母，之后为相邻交易日的日终权益之比减一。权益沿用账本的费后值及已记录估值。每日和累计费用以原币种的 `Decimal` 返回。前期权益为零时当期收益为 `None`。
+- **基准收益。** 默认使用策略配置中的证券，也可指定非空且无重复的同批次 UUID 元组。用首个回放交易日的可见原始收盘价等权建仓，固定份额持有，不计费用，也不应用模拟成交限制。首日无基准收益。每个交易日仅使用当日 cutoff 可见的收盘价，迟到报价按缺价处理。首日任一证券缺价时无法建仓，之后缺价则该日与下一期收益为 `None`。缺价日期由 `benchmark_missing_sessions` 返回。
+- **统计口径。** `portfolio` 和 `benchmark` 各包含累计收益、夏普、最大回撤、胜率。累计收益按简单收益复利，最大回撤从净值 1 起算并以非正小数返回，胜率为严格正收益日占比。夏普按零无风险利率及样本标准差计算，不年化。首日策略收益纳入策略统计，基准统计从第二日开始。统计期内有缺期或无样本时，对应整组指标为 `None`。夏普另要求至少两期且收益有变动，非有限指标也以 `None` 返回。
+
+`report()` 用同样的已提交区间生成策略净值及回撤图，基准有连续收益时叠加基准净值。策略收益为空或有缺期时返回 `DATA_UNAVAILABLE`。可指定已有目录下的 PNG、PDF 等输出路径，保存失败不影响账本。调用方负责关闭返回的 Matplotlib `Figure`。
 
 ## QuantToolkitAdapter
 
@@ -171,10 +190,6 @@ def capabilities(
 ) -> tuple[Capability, ...]: ...
 def describe(name: str) -> Capability: ...
 def for_strategy(*, market: MarketView) -> StrategyAnalytics: ...
-def performance(history: CompletedEquityHistory) -> PerformanceResult: ...
-def report(
-    kind: ReportKind, artifacts: ReportArtifacts, *, output: Path | None = None
-) -> Figure: ...
 ```
 
 策略入口初版为 `StrategyAnalytics.feature(name, instruments, *, lookback_sessions, params) -> FeatureResult`。由绑定的 MarketView 取数，`params` 只允许该能力的标量选项。通过内部固定绑定调用对应公开函数，窗口或偏移先校验整数域。首版 fixture 显式绑定 `price_col="close"`，以原始收盘价计算。采用调整价格时，批次须证明该价格在 `as_of` 可得。策略得到不可修改的领域结果，窗口、证券、批次、`as_of` 和列口径可追溯。完整 Toolkit 查询清单仅用于检查和显示。标签、训练、写文件、联网和私有函数不暴露给策略。
@@ -203,4 +218,4 @@ def report(
 
 `factors.combine.combine_scores` 在策略通道中接收 `n_periods` 和 `window`，默认值同上。Adapter 对两项均有效的证券按日做截面标准化，再调用 Toolkit 合成动量与低波动分数。三个入口都只输出实际可见的行情观察，结果记录相关期数、请求证券、截止时点和批次 ID。
 
-`capabilities` 与 `describe` 可查看 Toolkit 目录。Toolkit 的当前计算入口为 `for_strategy` 所提供的特征。日频回放组件可分别调用，也可以通过 `Replay` 统一执行和恢复。绩效和报告接口按实施计划加入。
+`capabilities` 与 `describe` 可查看 Toolkit 目录。策略计算通过 `for_strategy` 调用。日频回放组件可分别调用，也可以通过 `Replay` 执行、恢复并读取绩效和报告。

@@ -118,6 +118,37 @@ def test_momentum_rotation_resumes_and_sells_before_buying(momentum_inputs):
     }
 
 
+@pytest.mark.parametrize("late_index", [None, 0, 2])
+def test_performance_benchmark_fixed_shares_and_no_backfill(
+    momentum_inputs, late_index
+):
+    _, _, data, _ = momentum_inputs
+    if late_index is not None:
+        data["bars"][6 + late_index]["available_at"] = "2024-07-10T20:00:00Z"
+    run = _create(momentum_inputs)
+    for seq in range(1, 7):
+        run.step(seq)
+
+    result = run.performance(benchmark_instruments=(B, A))
+    assert result.benchmark_instruments == (A, B)
+    assert result.portfolio.total_return is not None
+    daily = [day.benchmark_return for day in result.days]
+    assert daily[0] is None
+    if late_index is None:
+        assert daily[1:] == pytest.approx([0, 0.1, 0, 27 / 22 - 1, 0])
+        assert result.benchmark.total_return == pytest.approx(0.35)
+    else:
+        assert result.benchmark.total_return is None
+        assert result.benchmark_missing_sessions == (
+            result.days[late_index].session_date,
+        )
+        if late_index == 0:
+            assert daily == [None] * 6
+        else:
+            assert daily[2:4] == [None, None]
+            assert daily[4:] == pytest.approx([27 / 22 - 1, 0])
+
+
 def test_composite_rotation_prefers_lower_volatility_and_resumes(momentum_inputs):
     path, source, data, spec = momentum_inputs
     # 两个调仓日的单期收益相同, A 的前一日收益变动更大

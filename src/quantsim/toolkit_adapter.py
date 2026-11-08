@@ -1,14 +1,18 @@
-"""通过 QuantToolKit 公开契约提供受时点约束的策略特征
+"""通过 QuantToolKit 公开契约计算策略特征和回放绩效
 
 QuantToolkitAdapter.__init__ 加载并核对公开函数签名及来源契约
 capabilities 和 describe 查询能力, for_strategy 将当前 MarketView 绑定到 StrategyAnalytics
 StrategyAnalytics.feature 读取可见历史, 计算历史收益、历史波动率或两者的合成分数
+Replay 使用本模块的基准、绩效和出图入口, 不向策略暴露这些操作
 """
 
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 from inspect import Parameter, signature
+from math import isfinite
+from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 import pandas as pd
@@ -16,11 +20,94 @@ import pandas as pd
 from quantsim.errors import ErrorCode, SimulatorError
 from quantsim.market_data import MarketView
 
+if TYPE_CHECKING:
+    from matplotlib.figure import Figure
+
 _HISTORICAL_RETURN = "panel.returns.historical_return"
 _HISTORY_VOL = "panel.volatility.history_vol"
 _COMBINE_SCORES = "factors.combine.combine_scores"
 _PREPARE_PANEL = "panel.transfer.to_date_ticker_frame"
 _STRATEGY_FEATURES = (_HISTORICAL_RETURN, _HISTORY_VOL, _COMBINE_SCORES)
+
+
+@dataclass(frozen=True)
+class PerformanceMetrics:
+    total_return: float | None
+    sharpe: float | None
+    max_drawdown: float | None
+    win_rate: float | None
+
+
+def replay_metrics(returns: pd.Series) -> PerformanceMetrics:
+    """用连续、非重叠的单期简单收益计算绩效, 缺期时区间指标均未定义"""
+    if returns.empty or returns.isna().any():
+        return PerformanceMetrics(None, None, None, None)
+    try:
+        from quanttoolkit import metrics
+    except (ImportError, OSError) as exc:
+        raise SimulatorError(
+            ErrorCode.DEPENDENCY_UNAVAILABLE, "无法导入 QuantToolKit 绩效接口"
+        ) from exc
+
+    prepared = metrics.prepare_portfolio_returns(returns)
+    total = metrics.total_return(returns=prepared)
+    sharpe = metrics.sharpe(returns=prepared) if prepared.nunique() > 1 else None
+    drawdown = metrics.max_drawdown(returns=prepared)
+    wins = metrics.win_rate(returns=prepared)
+    return PerformanceMetrics(
+        total if isfinite(total) else None,
+        sharpe if sharpe is not None and isfinite(sharpe) else None,
+        drawdown if isfinite(drawdown) else None,
+        wins if isfinite(wins) else None,
+    )
+
+
+def replay_benchmark(prices: pd.DataFrame) -> pd.Series:
+    """从列为 date、ticker、close 的完整日历网格计算等权持有基准日收益"""
+    try:
+        from quanttoolkit.panel.transfer import to_date_ticker_frame
+        from quanttoolkit.portfolio.benchmark import equal_weight_hold
+    except (ImportError, OSError) as exc:
+        raise SimulatorError(
+            ErrorCode.DEPENDENCY_UNAVAILABLE, "无法导入 QuantToolKit 基准接口"
+        ) from exc
+
+    panel = to_date_ticker_frame(df=prices)
+    return equal_weight_hold(prices=panel, price_col="close")
+
+
+def replay_report(
+    returns: pd.Series, benchmark: pd.Series, *, output: Path | None
+) -> "Figure":
+    """渲染事件回放净值及回撤, 基准连续时在净值图叠加对照"""
+    try:
+        from matplotlib import pyplot as plt
+        from quanttoolkit.figure import plot_report
+        from quanttoolkit.metrics import prepare_portfolio_returns
+    except (ImportError, OSError) as exc:
+        raise SimulatorError(
+            ErrorCode.DEPENDENCY_UNAVAILABLE, "无法导入 QuantToolKit 报告接口"
+        ) from exc
+
+    figure = plot_report(
+        "event_driven", portfolio_returns=prepare_portfolio_returns(returns)
+    )
+    try:
+        if not benchmark.empty and not benchmark.isna().any():
+            nav = (1 + benchmark.reindex(returns.index, fill_value=0.0)).cumprod()
+            ax = figure.axes[0]
+            ax.lines[0].set_label("Portfolio")
+            ax.plot(nav.index, nav, label="Equal-weight hold")
+            ax.legend()
+        if output is not None:
+            figure.savefig(output, dpi=150)
+    except OSError as exc:
+        plt.close(figure)
+        raise SimulatorError(ErrorCode.DATA_UNAVAILABLE, "无法保存回放报告") from exc
+    except Exception:
+        plt.close(figure)
+        raise
+    return figure
 
 
 @dataclass(frozen=True)

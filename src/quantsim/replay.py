@@ -2,6 +2,7 @@
 
 Replay.create 冻结运行配置并原子写入期初流水
 Replay.next_tick 查询下一待处理步骤, Replay.step 按显式序号提交或读回既有快照
+Replay.performance 和 Replay.report 只读取已提交区间, 不推进运行
 恢复只依赖数据库中的运行配置、检查点及已提交业务记录
 """
 
@@ -10,10 +11,11 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 from pathlib import Path
 from types import MappingProxyType
+from typing import TYPE_CHECKING
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 import duckdb
@@ -29,6 +31,7 @@ from quantsim.execution import (
     validate_execution_config,
 )
 from quantsim.market_data import MarketDataRepository, Tick
+from quantsim.performance import PerformanceResult, build_performance, report_series
 from quantsim.portfolio import BookingResult, PortfolioSnapshot, PositionMark
 from quantsim.scenario import ScenarioEvent, ScenarioEventEngine, ScenarioState
 from quantsim.simulation_clock import SimulationClock
@@ -38,6 +41,10 @@ from quantsim.strategy import (
     OrderIntent,
     StrategyContext,
 )
+from quantsim.toolkit_adapter import replay_report
+
+if TYPE_CHECKING:
+    from matplotlib.figure import Figure
 
 _FIXED_ROUND_TRIP = "fixed_round_trip"
 _MOMENTUM_ROTATION = "momentum_rotation"
@@ -73,7 +80,7 @@ class Replay:
         with _connection(self._path) as db:
             row = db.execute(
                 """
-                SELECT s.data_version, s.start_session, s.end_session, s.initial_cash,
+                SELECT s.data_version, s.start_session, s.end_session, s.initial_cash, s.currency,
                        s.execution_config, s.scenario_version, s.scenario_manifest,
                        t.strategy_id, t.name, t.code_version, t.config
                 FROM simulations s JOIN strategies t USING (strategy_id)
@@ -88,6 +95,7 @@ class Replay:
             start,
             end,
             self._initial_cash,
+            self._currency,
             execution,
             scenario_version,
             events,
@@ -306,6 +314,91 @@ class Replay:
             committed = self._committed_seq(db)
         return SimulationClock(self._sessions, committed_seq=committed).peek()
 
+    def performance(
+        self, *, benchmark_instruments: tuple[UUID, ...] | None = None
+    ) -> PerformanceResult:
+        """统计从期初到最后已提交日的权益、费用、收益与基准
+
+        基准默认使用策略证券池, 可传入非空且无重复的同批次 UUID 元组
+        损坏或不连续的检查点返回 INCONSISTENT_STATE, 空运行返回空日序列
+        """
+        if benchmark_instruments is None:
+            benchmark_instruments = (
+                (self._strategy.instrument_id,)
+                if isinstance(self._strategy, FixedRoundTripStrategy)
+                else self._strategy.instruments
+            )
+        if (
+            not isinstance(benchmark_instruments, tuple)
+            or not benchmark_instruments
+            or not all(isinstance(key, UUID) for key in benchmark_instruments)
+            or len(set(benchmark_instruments)) != len(benchmark_instruments)
+        ):
+            raise SimulatorError(
+                ErrorCode.INVALID_REQUEST, "基准须为非空的唯一 UUID 元组"
+            )
+        instruments = tuple(sorted(benchmark_instruments))
+        with _connection(self._path) as db:
+            _check_instruments(db, self._version, set(instruments))
+            rows = db.execute(
+                """
+                WITH fees AS (
+                    SELECT tick_seq, sum(fee) AS amount
+                    FROM fills WHERE simulation_id = ? GROUP BY tick_seq
+                )
+                SELECT e.tick_seq, e.payload, coalesce(f.amount, 0)
+                FROM events e LEFT JOIN fees f USING (tick_seq)
+                WHERE e.simulation_id = ? AND event_type = 'tick_committed' AND event_seq = 0
+                ORDER BY e.tick_seq
+                """,
+                [self._simulation_id, self._simulation_id],
+            ).fetchall()
+        sessions = self._sessions[: len(rows)]
+        equities = []
+        fees = []
+        if len(rows) > len(sessions):
+            raise SimulatorError(ErrorCode.INCONSISTENT_STATE, "检查点超出回放范围")
+        for expected, (seq, payload, fee) in enumerate(rows, start=1):
+            if seq != expected:
+                raise SimulatorError(ErrorCode.INCONSISTENT_STATE, "回放检查点不连续")
+            _, equity = self._checkpoint_amounts(
+                payload, sessions[seq - 1].session_date
+            )
+            equities.append(equity)
+            fees.append(fee)
+        return build_performance(
+            simulation_id=self._simulation_id,
+            version=self._version,
+            currency=self._currency,
+            initial_equity=self._initial_cash,
+            market=self._market,
+            sessions=sessions,
+            equities=tuple(equities),
+            fees=tuple(fees),
+            benchmark_instruments=instruments,
+            complete=len(sessions) == len(self._sessions),
+        )
+
+    def report(
+        self,
+        *,
+        benchmark_instruments: tuple[UUID, ...] | None = None,
+        output: Path | None = None,
+    ) -> "Figure":
+        """渲染已提交区间的净值和回撤, 调用方负责关闭返回的 Figure
+
+        缺少连续策略收益时返回 DATA_UNAVAILABLE, output 可保存到已有目录
+        """
+        if output is not None and (
+            not isinstance(output, Path) or output.resolve() == self._path
+        ):
+            raise SimulatorError(ErrorCode.INVALID_REQUEST, "无效的报告输出路径")
+        result = self.performance(benchmark_instruments=benchmark_instruments)
+        returns, benchmark = report_series(result)
+        if returns.empty or returns.isna().any():
+            raise SimulatorError(ErrorCode.DATA_UNAVAILABLE, "报告需要连续的策略收益")
+        return replay_report(returns, benchmark, output=output)
+
     def step(self, tick_seq: int) -> PortfolioSnapshot:
         """提交指定的下一 tick, 重试已提交的序号返回持久化快照
 
@@ -471,14 +564,7 @@ class Replay:
             )
         day = self._sessions[seq - 1]
         tick = Tick(day.session_date, day.market_close_at, day.cutoff_at, seq)
-        checkpoint = json.loads(row[0])
-        if (checkpoint["session_date"], checkpoint["data_version"]) != (
-            tick.session_date.isoformat(),
-            self._version,
-        ):
-            raise SimulatorError(
-                ErrorCode.INCONSISTENT_STATE, "检查点的日期或行情版本不一致"
-            )
+        cash, equity = self._checkpoint_amounts(row[0], tick.session_date)
         positions = tuple(
             PositionMark(*position)
             for position in db.execute(
@@ -496,10 +582,29 @@ class Replay:
         return PortfolioSnapshot(
             tick,
             self._version,
-            Decimal(checkpoint["cash"]),
+            cash,
             positions,
-            Decimal(checkpoint["equity"]),
+            equity,
         )
+
+    def _checkpoint_amounts(
+        self, payload: str, session_date: date
+    ) -> tuple[Decimal, Decimal]:
+        try:
+            checkpoint = json.loads(payload)
+            if (checkpoint["session_date"], checkpoint["data_version"]) != (
+                session_date.isoformat(),
+                self._version,
+            ):
+                raise ValueError("检查点的日期或行情版本不一致")
+            cash, equity = Decimal(checkpoint["cash"]), Decimal(checkpoint["equity"])
+            if not (cash.is_finite() and equity.is_finite() and 0 <= cash <= equity):
+                raise ValueError("检查点金额不一致")
+        except (InvalidOperation, KeyError, TypeError, ValueError) as exc:
+            raise SimulatorError(
+                ErrorCode.INCONSISTENT_STATE, "回放检查点无效"
+            ) from exc
+        return cash, equity
 
     def _write_tick(
         self,

@@ -36,6 +36,12 @@ uv run --locked python examples/replay_round_trip.py
 
 需要保留运行时，使用自己的数据库路径。重新打开 `Replay(path, simulation_id)`，用 `next_tick()` 查询待处理步骤。重复调用 `step(seq)` 会读回该步已提交的快照。见 [回放接口](docs/api.md#replay)。
 
+加上 `--report` 可输出费后累计收益、等权持有基准和费用，并保存净值及回撤图。三日样本的策略累计收益为 0.977%，基准累计收益为 20.000%，成交费用为 0.23 USD。
+
+```sh
+MPLBACKEND=Agg uv run --locked python examples/replay_round_trip.py --report /tmp/quantsim-replay.png
+```
+
 ## 运行一条特征
 
 ```python
