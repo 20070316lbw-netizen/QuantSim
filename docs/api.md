@@ -153,6 +153,8 @@ class Replay:
     def __init__(self, path: Path, simulation_id: UUID) -> None: ...
     @classmethod
     def create(cls, path: Path, spec: ReplaySpec) -> Replay: ...
+    @property
+    def spec(self) -> ReplaySpec: ...
     def next_tick(self) -> Tick | None: ...
     def step(self, tick_seq: int) -> PortfolioSnapshot: ...
     def performance(
@@ -164,6 +166,13 @@ class Replay:
         benchmark_instruments: tuple[UUID, ...] | None = None,
         output: Path | None = None,
     ) -> Figure: ...
+    def record(
+        self,
+        *,
+        benchmark_instruments: tuple[UUID, ...] | None = None,
+        report_directory: Path | None = None,
+    ) -> ReplayRecord: ...
+    def records(self) -> tuple[ReplayRecord, ...]: ...
 ```
 
 [回放入口](../src/quantsim/replay.py) 使用已初始化、已导入行情的 DuckDB 文件。创建运行时固定数据版本、日期、执行参数、策略及其版本、halt / resume 事件和依赖标识，并原子写入初始现金流水。支持 `FixedRoundTripStrategy` 和 `MomentumRotationStrategy`，打开既有运行时从已保存配置恢复策略。调用者提供唯一 UUID 和依赖标识，确认回放区间无公司行动。币种来自冻结数据包。日期区间须在冻结日历首末日期内且包含交易日，货币单位及账户金额须能以 `DECIMAL(24,8)` 精确保存。创建时如 ID 已存在，使用构造函数打开既有运行。
@@ -180,7 +189,15 @@ class Replay:
 - **基准收益。** 默认使用策略配置中的证券，也可指定非空且无重复的同批次 UUID 元组。用首个回放交易日的可见原始收盘价等权建仓，固定份额持有，不计费用，也不应用模拟成交限制。首日无基准收益。每个交易日仅使用当日 cutoff 可见的收盘价，迟到报价按缺价处理。首日任一证券缺价时无法建仓，之后缺价则该日与下一期收益为 `None`。缺价日期由 `benchmark_missing_sessions` 返回。
 - **统计口径。** `portfolio` 和 `benchmark` 各包含累计收益、夏普、最大回撤、胜率。累计收益按简单收益复利，最大回撤从净值 1 起算并以非正小数返回，胜率为严格正收益日占比。夏普按零无风险利率及样本标准差计算，不年化。首日策略收益纳入策略统计，基准统计从第二日开始。统计期内有缺期或无样本时，对应整组指标为 `None`。夏普另要求至少两期且收益有变动，非有限指标也以 `None` 返回。
 
-`report()` 用同样的已提交区间生成策略净值及回撤图，基准有连续收益时叠加基准净值。策略收益为空或有缺期时返回 `DATA_UNAVAILABLE`。可指定已有目录下的 PNG、PDF 等输出路径，保存失败不影响账本。调用方负责关闭返回的 Matplotlib `Figure`。
+`report()` 用同样的已提交区间生成策略净值及回撤图，基准有连续收益时叠加基准净值。策略收益为空或有缺期时返回 `DATA_UNAVAILABLE`。可指定已有目录下的 PNG、PDF 等输出路径。未指定扩展名时使用画布的默认格式。实际输出路径指向当前数据库时返回 `INVALID_REQUEST`，包括软链接和硬链接。调用方负责关闭返回的 Matplotlib `Figure`。
+
+### 回放运行记录
+
+`run.spec` 读回建档配置，包括策略参数、冻结数据版本、日期区间、期初现金、撮合参数、场景事件、种子和依赖标识。用 `dataclasses.replace(run.spec, simulation_id=uuid4())` 建立独立重跑，按提交 tick 和意图顺序比较业务数据。运行、订单和成交 UUID 会随运行 ID 改变。
+
+`record()` 保存最后一个已提交 tick 对应的绩效摘要。至少要有一个已提交交易日，空运行返回 `DATA_UNAVAILABLE`。记录按运行、tick 及排序后的基准证券 UUID 去重。后续继续回放时，旧前缀记录仍可读取。重复调用且未指定报告目录时，保留该键下的已有记录及报告引用。`records()` 直接读取已存摘要，返回区间末日、完成状态、币种、费用、策略及基准指标、基准缺价日期和可选的报告路径与 SHA-256。
+
+传入已有目录 `record(report_directory=...)` 时，从同一份绩效结果生成 PNG。文件完整写入后，在支持硬链接的目录内以运行 ID 和内容摘要原子发布，再登记路径与摘要。若目标已有同一摘要的普通文件则复用，其他同名文件保留并返回 `INVALID_REQUEST`。报告生成失败保留已有记录和账本，可以重新调用。数据库登记失败时，已发布的 PNG 可能留在目录内，再次调用可登记重建结果。读取记录时不会打开 PNG。文件被移动或删除后，可以从当前已提交区间重新生成，旧前缀的图也可在重跑到对应 tick 时重建。旧数据库先用 `initialize_database(path)` 升级，已有运行可直接记录绩效。
 
 ## QuantToolkitAdapter
 

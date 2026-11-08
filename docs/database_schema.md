@@ -20,12 +20,13 @@ QuantSim 使用独立本地数据库。初期由单个回放进程串行写入�
 | `fills` | ExecutionEngine 产出的模拟成交，保留实际使用的 bar、参考价及费用 |
 | `cash_ledger` | PortfolioManager 产出的初始资金与净成交现金流水 |
 | `positions_daily` | PortfolioManager 的日终非零持仓，含标记价来源与 stale 状态 |
+| `replay_results` | 日频回放绩效摘要及可选的报告路径和 SHA-256。运行 ID、已提交 tick 和排序后的基准证券列表组成主键，配置通过运行 ID 追溯 |
 | `experiments` | 用户定义的研究问题、策略及固定配置 |
 | `backtest_runs` | 离线回测结果，关联实验及可选的事件回放运行。记录时间区间、依赖、数据、参数、结果和产物位置 |
 
 ## 初始化与历史市场表
 
-`initialize_database` 在同一事务内依次执行迁移、写入 `schema_migrations` 并更新 `schema_info`。任一步失败时回滚该次升级的全部变更。当前版本为 2，[版本 2 迁移](../src/quantsim/migrations/002_migration_history.sql) 新增迁移历史表。已有版本 1 库升级时补记 `baseline`，其原始执行时间未知，因此 `applied_at` 为 `NULL`。新库在同一事务应用两个版本并记录执行时间。重复初始化会核对版本、表集和迁移历史。
+`initialize_database` 在同一事务内依次执行迁移、写入 `schema_migrations` 并更新 `schema_info`。任一步失败时回滚该次升级的全部变更。[版本 2 迁移](../src/quantsim/migrations/002_migration_history.sql) 新增迁移历史表。[版本 3 迁移](../src/quantsim/migrations/003_replay_results.sql) 新增回放结果表，已有运行可从账本生成记录。已有版本 1 库升级时补记 `baseline`，其原始执行时间未知，因此 `applied_at` 为 `NULL`。新库在同一事务应用全部版本并记录执行时间。重复初始化会核对版本、表集和迁移历史。
 
 新增结构时在 `database.py` 追加连续版本、稳定名称、迁移函数和迁移后的完整表集。已发布的迁移用于复现旧结构。升级前备份数据库，验收覆盖旧数据保留、重复初始化和失败回滚。表集检查只核对表名和类型，列与约束由针对实际旧版本的迁移测试验证。
 

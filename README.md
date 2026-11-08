@@ -42,6 +42,13 @@ uv run --locked python examples/replay_round_trip.py
 MPLBACKEND=Agg uv run --locked python examples/replay_round_trip.py --report /tmp/quantsim-replay.png
 ```
 
+用 `--save-run` 可将回放数据库及已登记的 PNG 保存到同一个已有目录。示例会打印运行 ID。随后可以用 `Replay(path, simulation_id).records()` 读回绩效摘要和报告位置。见 [回放运行记录](docs/api.md#回放运行记录)。
+
+```sh
+mkdir -p /tmp/quantsim-runs
+MPLBACKEND=Agg uv run --locked python examples/replay_round_trip.py --save-run /tmp/quantsim-runs
+```
+
 ## 运行一条特征
 
 ```python
@@ -78,4 +85,4 @@ with TemporaryDirectory() as directory:
 
 导入使用 [历史市场格式](docs/historical_market.md#历史数据包)。每批含单市场、单币种、原始日线、带时区的日历和证券上市记录。调整收盘价在 `adjusted_prices` 中提供独立可用时间。相同文件重复导入返回同一批次 ID。
 
-数据库通过 `initialize_database(path)` 初始化并升级到版本 2。版本 1 库可直接升级并保留已有数据，建议升级前备份。升级后可在 `schema_migrations` 查询已应用版本、名称和时间。早于版本 1 且没有匹配版本记录的开发数据库需要重新导入。见 [数据库结构与迁移](docs/database_schema.md#初始化与历史市场表)。
+数据库通过 `initialize_database(path)` 初始化并升级到版本 3。版本 1 和版本 2 库可直接升级并保留已有数据，建议升级前备份。升级后可在 `schema_migrations` 查询已应用版本、名称和时间。早于版本 1 且没有匹配版本记录的开发数据库需要重新导入。见 [数据库结构与迁移](docs/database_schema.md#初始化与历史市场表)。

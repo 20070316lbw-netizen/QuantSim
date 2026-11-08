@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from inspect import Parameter, signature
 from math import isfinite
+from os.path import splitext
 from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import UUID
@@ -77,7 +78,11 @@ def replay_benchmark(prices: pd.DataFrame) -> pd.Series:
 
 
 def replay_report(
-    returns: pd.Series, benchmark: pd.Series, *, output: Path | None
+    returns: pd.Series,
+    benchmark: pd.Series,
+    *,
+    output: Path | None,
+    database_path: Path | None = None,
 ) -> "Figure":
     """渲染事件回放净值及回撤, 基准连续时在净值图叠加对照"""
     try:
@@ -100,6 +105,21 @@ def replay_report(
             ax.plot(nav.index, nav, label="Equal-weight hold")
             ax.legend()
         if output is not None:
+            if database_path is not None:
+                # 先按当前画布的默认格式补扩展名, 再检查实际写入目标
+                filename = str(output)
+                if not splitext(filename)[1][1:]:
+                    output = Path(
+                        filename.rstrip(".")
+                        + "."
+                        + figure.canvas.get_default_filetype()
+                    )
+                if output.resolve() == database_path or (
+                    output.exists() and output.samefile(database_path)
+                ):
+                    raise SimulatorError(
+                        ErrorCode.INVALID_REQUEST, "报告输出路径指向回放数据库"
+                    )
             figure.savefig(output, dpi=150)
     except OSError as exc:
         plt.close(figure)

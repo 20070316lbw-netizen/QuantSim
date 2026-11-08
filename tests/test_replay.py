@@ -7,7 +7,9 @@ import json
 from dataclasses import replace
 from datetime import date, datetime
 from decimal import Decimal
+from hashlib import sha256
 from pathlib import Path
+from shutil import copyfile
 from statistics import mean, stdev
 from uuid import UUID, uuid4
 
@@ -192,13 +194,15 @@ def test_report_renders_equity_and_benchmark(replay_inputs, tmp_path, monkeypatc
     monkeypatch.setenv("MPLBACKEND", "Agg")
     monkeypatch.setenv("MPLCONFIGDIR", str(tmp_path))
     from matplotlib import pyplot as plt
+    from matplotlib import rc_context
 
     path, spec = replay_inputs
     run = Replay.create(path, spec)
     for seq in (1, 2, 3):
         run.step(seq)
     output = tmp_path / "report.png"
-    figure = run.report(output=output)
+    with rc_context({"savefig.format": "png"}):
+        figure = run.report(output=output.with_suffix(""))
     try:
         nav, drawdown = figure.axes
         assert nav.lines[0].get_ydata() == pytest.approx([1, 0.99989, 1.00977])
@@ -211,6 +215,161 @@ def test_report_renders_equity_and_benchmark(replay_inputs, tmp_path, monkeypatc
         run.report(output=tmp_path / "missing" / "report.png")
     assert error.value.code == ErrorCode.DATA_UNAVAILABLE
     assert run.next_tick() is None
+
+
+@pytest.mark.parametrize("alias", ["hardlink", "default_extension"])
+def test_report_rejects_database_alias(replay_inputs, tmp_path, monkeypatch, alias):
+    monkeypatch.setenv("MPLBACKEND", "Agg")
+    monkeypatch.setenv("MPLCONFIGDIR", str(tmp_path))
+    from matplotlib import rc_context
+
+    path, spec = replay_inputs
+    if alias == "hardlink":
+        output = tmp_path / "report.png"
+    else:
+        output = tmp_path / "report"
+        path = path.rename(output.with_suffix(".png"))
+    run = Replay.create(path, spec)
+    run.step(1)
+    if alias == "hardlink":
+        output.hardlink_to(path)
+    before = path.read_bytes()
+    with rc_context({"savefig.format": "png"}), pytest.raises(SimulatorError) as error:
+        run.report(output=output)
+    assert error.value.code is ErrorCode.INVALID_REQUEST
+    assert path.read_bytes() == before
+    assert Replay(path, spec.simulation_id).next_tick().seq == 2
+
+
+def test_record_rejects_generated_report_path_matching_database(
+    replay_inputs, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("MPLBACKEND", "Agg")
+    monkeypatch.setenv("MPLCONFIGDIR", str(tmp_path))
+    path, spec = replay_inputs
+    run = Replay.create(path, spec)
+    run.step(1)
+    record = run.record(report_directory=tmp_path)
+
+    directory = tmp_path / "collision"
+    directory.mkdir()
+    collision = directory / record.report_path.name
+    copyfile(path, collision)
+    before = collision.read_bytes()
+    reopened = Replay(collision, spec.simulation_id)
+    with pytest.raises(SimulatorError) as error:
+        reopened.record(report_directory=directory)
+    assert error.value.code is ErrorCode.INVALID_REQUEST
+    assert collision.read_bytes() == before
+    assert reopened.records() == (record,)
+    assert tuple(directory.iterdir()) == (collision,)
+
+
+def test_record_persists_prefix_and_rebuilds_report(
+    replay_inputs, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("MPLBACKEND", "Agg")
+    monkeypatch.setenv("MPLCONFIGDIR", str(tmp_path))
+    path, spec = replay_inputs
+    run = Replay.create(path, spec)
+    with pytest.raises(SimulatorError) as error:
+        run.record()
+    assert error.value.code is ErrorCode.DATA_UNAVAILABLE
+    assert run.records() == ()
+
+    run.step(1)
+    prefix = run.record()
+    assert (prefix.tick_seq, prefix.end_session, prefix.complete) == (
+        1,
+        spec.start_session,
+        False,
+    )
+    assert prefix.report_path is None
+    assert run.next_tick().seq == 2
+    run.step(2)
+    run.step(3)
+    with pytest.raises(SimulatorError) as error:
+        run.record(report_directory=tmp_path / "missing")
+    assert error.value.code is ErrorCode.DATA_UNAVAILABLE
+    assert run.records() == (prefix,)
+
+    record = run.record(report_directory=tmp_path)
+    assert record.complete
+    assert record.total_fees == Decimal("0.23")
+    assert record.portfolio.total_return == pytest.approx(0.00977)
+    assert record.benchmark.total_return == pytest.approx(0.2)
+    assert record.report_path.suffix == ".png"
+    assert sha256(record.report_path.read_bytes()).hexdigest() == record.report_sha256
+    reopened = Replay(path, spec.simulation_id)
+    assert reopened.records() == (prefix, record)
+    assert reopened.record() == record
+    assert reopened.record(report_directory=tmp_path) == record
+    with pytest.raises(SimulatorError):
+        reopened.record(report_directory=tmp_path / "missing")
+    assert reopened.records() == (prefix, record)
+    record.report_path.unlink()
+    assert reopened.records() == (prefix, record)
+    assert reopened.record(report_directory=tmp_path) == record
+    assert record.report_path.is_file()
+    assert reopened.next_tick() is None
+
+
+def test_saved_configuration_reruns_after_version_two_upgrade(replay_inputs):
+    path, spec = replay_inputs
+    # 使用版本 2 的表集和迁移历史保存前两日, 升级后继续
+    with duckdb.connect(path) as db:
+        db.execute("DROP TABLE replay_results")
+        db.execute("DELETE FROM schema_migrations WHERE version = 3")
+        db.execute("UPDATE schema_info SET version = 2")
+    cutoff = datetime.fromisoformat("2024-07-05T20:00:00Z")
+    event = ScenarioEvent(1, cutoff, cutoff, "resume")
+    spec = replace(spec, seed=42, scenario_events=(event,))
+    run = Replay.create(path, spec)
+    run.step(1)
+    run.step(2)
+    before = run.performance()
+
+    initialize_database(path)
+    initialize_database(path)
+    reopened = Replay(path, spec.simulation_id)
+    assert reopened.spec == spec
+    assert reopened.performance() == before
+    assert reopened.records() == ()
+    end = reopened.step(3)
+    record = reopened.record()
+
+    second = Replay.create(path, replace(reopened.spec, simulation_id=uuid4()))
+    for seq in (1, 2, 3):
+        last = second.step(seq)
+    assert last == end
+    assert replace(second.record(), simulation_id=spec.simulation_id) == record
+
+    queries = (
+        """
+        SELECT * EXCLUDE (simulation_id, order_id) FROM orders
+        WHERE simulation_id = ? ORDER BY submitted_tick, intent_seq
+        """,
+        """
+        SELECT f.* EXCLUDE (simulation_id, fill_id, order_id), o.submitted_tick, o.intent_seq
+        FROM fills f JOIN orders o USING (order_id)
+        WHERE f.simulation_id = ? ORDER BY f.tick_seq, o.submitted_tick, o.intent_seq
+        """,
+        """
+        SELECT l.* EXCLUDE (simulation_id, fill_id), o.submitted_tick, o.intent_seq
+        FROM cash_ledger l LEFT JOIN fills f USING (fill_id) LEFT JOIN orders o USING (order_id)
+        WHERE l.simulation_id = ? ORDER BY l.tick_seq, l.entry_seq
+        """,
+        """
+        SELECT tick_seq, payload FROM events WHERE simulation_id = ?
+        AND event_type = 'tick_committed' ORDER BY tick_seq
+        """,
+    )
+    with duckdb.connect(path, read_only=True) as db:
+        for query in queries:
+            assert (
+                db.execute(query, [spec.simulation_id]).fetchall()
+                == db.execute(query, [second.spec.simulation_id]).fetchall()
+            )
 
 
 def test_performance_rejects_a_gap_in_checkpoints(replay_inputs):

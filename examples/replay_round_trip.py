@@ -18,11 +18,16 @@ from quantsim.strategy import FixedRoundTripStrategy
 def main() -> None:
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("--report", type=Path, help="保存净值和回撤图的路径")
+    parser.add_argument(
+        "--save-run", type=Path, help="将数据库和索引报告保存到已有目录"
+    )
     args = parser.parse_args()
+    if args.save_run is not None and not args.save_run.is_dir():
+        parser.error("--save-run 需要一个已有目录")
     directory = Path(__file__).resolve().parent
     lock_hash = sha256((directory.parent / "uv.lock").read_bytes()).hexdigest()
     with TemporaryDirectory() as temp:
-        path = Path(temp) / "round_trip.duckdb"
+        path = (args.save_run or Path(temp)) / "round_trip.duckdb"
         initialize_database(path)
         version = MarketDataRepository(path).import_batch(directory / "round_trip.json")
         run = Replay.create(
@@ -35,7 +40,9 @@ def main() -> None:
                 initial_cash=Decimal(1000),
                 execution=ExecutionConfig(Decimal(1), Decimal("0.001")),
                 strategy=FixedRoundTripStrategy(UUID(int=1), 10),
-                toolkit_revision="local" if args.report else "not_used",
+                toolkit_revision="local"
+                if args.report or args.save_run
+                else "not_used",
                 lock_hash=lock_hash,
             ),
         )
@@ -56,6 +63,11 @@ def main() -> None:
             figure = run.report(output=args.report)
             plt.close(figure)
             print(f"回放报告 {args.report}")
+        if args.save_run is not None:
+            record = run.record(report_directory=args.save_run)
+            print(f"运行 ID {record.simulation_id}")
+            print(f"回放数据库 {path.resolve()}")
+            print(f"已登记报告 {record.report_path}")
 
 
 if __name__ == "__main__":

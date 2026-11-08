@@ -37,6 +37,7 @@ _V1_TABLES = {
     )
 }
 _V2_TABLES = _V1_TABLES | {("main", "schema_migrations", "BASE TABLE")}
+_V3_TABLES = _V2_TABLES | {("main", "replay_results", "BASE TABLE")}
 
 
 def _baseline(connection: duckdb.DuckDBPyConnection) -> None:
@@ -50,10 +51,16 @@ def _create_migration_history(connection: duckdb.DuckDBPyConnection) -> None:
     connection.execute(migration.read_text(encoding="utf-8"))
 
 
+def _create_replay_results(connection: duckdb.DuckDBPyConnection) -> None:
+    migration = files("quantsim").joinpath("migrations", "003_replay_results.sql")
+    connection.execute(migration.read_text(encoding="utf-8"))
+
+
 # 依次登记版本、稳定名称、迁移函数和迁移后的完整表集
 _MIGRATIONS = (
     (1, "baseline", _baseline, _V1_TABLES),
     (2, "migration_history", _create_migration_history, _V2_TABLES),
+    (3, "replay_results", _create_replay_results, _V3_TABLES),
 )
 
 

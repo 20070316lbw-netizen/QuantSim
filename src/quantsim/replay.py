@@ -3,6 +3,7 @@
 Replay.create 冻结运行配置并原子写入期初流水
 Replay.next_tick 查询下一待处理步骤, Replay.step 按显式序号提交或读回既有快照
 Replay.performance 和 Replay.report 只读取已提交区间, 不推进运行
+Replay.record 和 Replay.records 保存和读取已提交区间的绩效及报告引用
 恢复只依赖数据库中的运行配置、检查点及已提交业务记录
 """
 
@@ -31,7 +32,13 @@ from quantsim.execution import (
     validate_execution_config,
 )
 from quantsim.market_data import MarketDataRepository, Tick
-from quantsim.performance import PerformanceResult, build_performance, report_series
+from quantsim.performance import (
+    PerformanceResult,
+    ReplayRecord,
+    build_performance,
+    publish_report,
+    render_report,
+)
 from quantsim.portfolio import BookingResult, PortfolioSnapshot, PositionMark
 from quantsim.scenario import ScenarioEvent, ScenarioEventEngine, ScenarioState
 from quantsim.simulation_clock import SimulationClock
@@ -41,7 +48,7 @@ from quantsim.strategy import (
     OrderIntent,
     StrategyContext,
 )
-from quantsim.toolkit_adapter import replay_report
+from quantsim.toolkit_adapter import PerformanceMetrics
 
 if TYPE_CHECKING:
     from matplotlib.figure import Figure
@@ -82,7 +89,8 @@ class Replay:
                 """
                 SELECT s.data_version, s.start_session, s.end_session, s.initial_cash, s.currency,
                        s.execution_config, s.scenario_version, s.scenario_manifest,
-                       t.strategy_id, t.name, t.code_version, t.config
+                       t.strategy_id, t.name, t.code_version, t.config,
+                       s.seed, s.toolkit_revision, s.lock_hash
                 FROM simulations s JOIN strategies t USING (strategy_id)
                 WHERE s.simulation_id = ?
                 """,
@@ -103,6 +111,9 @@ class Replay:
             name,
             code_version,
             strategy,
+            seed,
+            toolkit_revision,
+            lock_hash,
         ) = row
         if scenario_version != _SCENARIO_VERSION or (name, code_version) not in (
             (_FIXED_ROUND_TRIP, _STRATEGY_VERSION),
@@ -139,6 +150,24 @@ class Replay:
             for event in json.loads(events)
         )
         self._sessions = self._market.sessions(self._version, start, end)
+        self._spec = ReplaySpec(
+            simulation_id=simulation_id,
+            data_version=self._version,
+            start_session=start,
+            end_session=end,
+            initial_cash=self._initial_cash,
+            execution=self._execution,
+            strategy=self._strategy,
+            toolkit_revision=toolkit_revision,
+            lock_hash=lock_hash,
+            scenario_events=self._events,
+            seed=seed,
+        )
+
+    @property
+    def spec(self) -> ReplaySpec:
+        """返回已保存的配置, 可更换 simulation_id 后用于重跑"""
+        return self._spec
 
     @classmethod
     def create(cls, path: Path, spec: ReplaySpec) -> "Replay":
@@ -394,10 +423,105 @@ class Replay:
         ):
             raise SimulatorError(ErrorCode.INVALID_REQUEST, "无效的报告输出路径")
         result = self.performance(benchmark_instruments=benchmark_instruments)
-        returns, benchmark = report_series(result)
-        if returns.empty or returns.isna().any():
-            raise SimulatorError(ErrorCode.DATA_UNAVAILABLE, "报告需要连续的策略收益")
-        return replay_report(returns, benchmark, output=output)
+        return render_report(result, output=output, database_path=self._path)
+
+    def record(
+        self,
+        *,
+        benchmark_instruments: tuple[UUID, ...] | None = None,
+        report_directory: Path | None = None,
+    ) -> ReplayRecord:
+        """保存非空已提交前缀的绩效, 可在已有目录发布 PNG 后一起登记
+
+        同一前缀及基准只有一条记录, 仅保存绩效时保留原记录
+        报告生成失败时保留账本及原记录, 可从检查点再次调用
+        """
+        if report_directory is not None and not isinstance(report_directory, Path):
+            raise SimulatorError(ErrorCode.INVALID_REQUEST, "无效的报告目录")
+        result = self.performance(benchmark_instruments=benchmark_instruments)
+        if not result.days:
+            raise SimulatorError(ErrorCode.DATA_UNAVAILABLE, "运行尚无已提交的交易日")
+        output, digest = (
+            publish_report(result, report_directory.resolve())
+            if report_directory is not None
+            else (None, None)
+        )
+        key = (
+            self._simulation_id,
+            len(result.days),
+            _json([str(key) for key in result.benchmark_instruments]),
+        )
+        metrics = _json(
+            {
+                "total_fees": str(result.total_fees),
+                "portfolio": asdict(result.portfolio),
+                "benchmark": asdict(result.benchmark),
+                "benchmark_missing_sessions": [
+                    day.isoformat() for day in result.benchmark_missing_sessions
+                ],
+            }
+        )
+        with _connection(self._path, write=True) as db:
+            db.execute(
+                """
+                INSERT INTO replay_results (
+                    simulation_id, tick_seq, benchmark_instruments, metrics,
+                    report_path, report_sha256
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT (simulation_id, tick_seq, benchmark_instruments)
+                DO UPDATE SET metrics = excluded.metrics, report_path = excluded.report_path,
+                              report_sha256 = excluded.report_sha256
+                WHERE excluded.report_path IS NOT NULL
+                """,
+                [*key, metrics, str(output) if output is not None else None, digest],
+            )
+            row = db.execute(
+                """
+                SELECT tick_seq, benchmark_instruments, metrics, report_path, report_sha256
+                FROM replay_results
+                WHERE simulation_id = ? AND tick_seq = ? AND benchmark_instruments = ?
+                """,
+                key,
+            ).fetchone()
+            assert row is not None
+        return self._read_record(row)
+
+    def records(self) -> tuple[ReplayRecord, ...]:
+        """按 tick 和基准证券池读取已保存的绩效, 无需重算或打开报告文件"""
+        with _connection(self._path) as db:
+            rows = db.execute(
+                """
+                SELECT tick_seq, benchmark_instruments, metrics, report_path, report_sha256
+                FROM replay_results WHERE simulation_id = ?
+                ORDER BY tick_seq, benchmark_instruments
+                """,
+                [self._simulation_id],
+            ).fetchall()
+        return tuple(self._read_record(row) for row in rows)
+
+    def _read_record(
+        self, row: tuple[int, str, str, str | None, str | None]
+    ) -> ReplayRecord:
+        seq, instruments, payload, path, digest = row
+        if seq > len(self._sessions):
+            raise SimulatorError(ErrorCode.INCONSISTENT_STATE, "绩效区间超出回放范围")
+        metrics = json.loads(payload)
+        return ReplayRecord(
+            simulation_id=self._simulation_id,
+            tick_seq=seq,
+            end_session=self._sessions[seq - 1].session_date,
+            complete=seq == len(self._sessions),
+            benchmark_instruments=tuple(UUID(key) for key in json.loads(instruments)),
+            benchmark_missing_sessions=tuple(
+                date.fromisoformat(day) for day in metrics["benchmark_missing_sessions"]
+            ),
+            currency=self._currency,
+            total_fees=Decimal(metrics["total_fees"]),
+            portfolio=PerformanceMetrics(**metrics["portfolio"]),
+            benchmark=PerformanceMetrics(**metrics["benchmark"]),
+            report_path=Path(path) if path is not None else None,
+            report_sha256=digest,
+        )
 
     def step(self, tick_seq: int) -> PortfolioSnapshot:
         """提交指定的下一 tick, 重试已提交的序号返回持久化快照

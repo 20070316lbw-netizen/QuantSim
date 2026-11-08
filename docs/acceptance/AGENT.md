@@ -1,4 +1,93 @@
-# QuantSim 独立验收 · M4-02 基准与统计
+# QuantSim 独立复验 · M4 报告路径保护
+
+## 验收对象
+
+HEAD `ac6f633fea4724d4f061c78ba575fbfd4d3b5959` 加 M4-03 工作区改动及报告路径修复。QuantToolKit 为干净的 `b19c1969ce38f283677cc3dc5992f8df6d5dd8ad`。使用一次性副本及合成行情，在专用临时目录写数据库和报告。
+
+| 本轮修改的业务文件 | SHA-256 |
+| --- | --- |
+| `src/quantsim/performance.py` | `92c5ea597e11b53de2faa0297459e20acb8d481286c319d1594ba11149ac8583` |
+| `src/quantsim/replay.py` | `c03d4552a016c50216827a43e20f4f722ac2d5cddaa9f798a9d1f4d83f376b04` |
+| `src/quantsim/toolkit_adapter.py` | `4d75c29a365998b3837bb47314ef89470ac6a455071bcee5aaa4256c943353e5` |
+| `tests/test_replay.py` | `af5f300cedf162dca4fce9e002e517b919b1a27fb4f065b5ce6be9f527b6f8ac` |
+
+其余业务文件与下方 M4-03 原验收一致。
+
+## 复现命令
+
+```sh
+export MPLBACKEND=Agg MPLCONFIGDIR="$TMPDIR/mpl" XDG_CACHE_HOME="$TMPDIR/cache"
+uv --no-cache run --locked --no-sync python -m pytest -q tests/test_replay.py -k 'report or record'
+uv --no-cache run --locked --no-sync python -m ruff check .
+uv --no-cache run --locked --no-sync python -m ruff format --check .
+git diff --check
+run_dir=$(mktemp -d "$TMPDIR/replay.XXXXXX")
+uv --no-cache run --locked --no-sync python examples/replay_round_trip.py --report "$run_dir/direct" --save-run "$run_dir"
+```
+
+## 通过条件
+
+1. 阶段快验的三条路径都返回 `INVALID_REQUEST`，数据库可重新打开，文件字节和已提交账本保持一致。分别用公开入口独立复现硬链接、缺扩展名后自动补成库名，以及自动登记报告文件名与库名重合。
+2. 普通出图和自动登记均成功。省略扩展名仍按画布默认格式生成图。重复发布同摘要的报告复用已有文件，删除后可从已提交区间重建。三日样例最终权益 1,009.77 USD，费用 0.23 USD。
+
+核对四项摘要，记录独立复现输出及任何阻断。全量回归由开发方运行。范围为本机支持硬链接的目录及单写入者。
+
+## 复验结果
+
+阶段快验子代理与 DeepSeek 均独立复验通过。DeepSeek 首轮跑完复现后在输出结论前超时，同一副本复跑原独立脚本后通过，四项文件摘要一致。三条冲突路径均返回 `INVALID_REQUEST`，库文件逐字节一致，正常报告可生成、复用和重建。定向回归 5 项、本地全量回归 109 项、Ruff 及差异检查均通过。正式报告 SHA-256 为 `32989df02bc3205c11fe2c5566497da3ba032aab771ae481876b715cb88a85bf`。
+
+<!-- report-protection-history -->
+
+<details>
+<summary>M4-03 运行记录原验收</summary>
+
+## 验收对象
+
+HEAD `ac6f633fea4724d4f061c78ba575fbfd4d3b5959` 加本轮工作区改动。QuantToolKit 使用干净的 `b19c1969ce38f283677cc3dc5992f8df6d5dd8ad`。本机 Python 3.12.13、uv 0.12.22、DuckDB 2.0.0、pandas 3.1.1。106 项 pytest 通过，Ruff 代码和格式检查及差异检查通过，示例最终权益 1,009.77 USD，数据库和 PNG 均落盘。
+
+在一次性副本运行离线样本，核对 HEAD、业务摘要和实际依赖导入路径。只在专用临时目录写脚本、测试数据库及报告。已跟踪与新增业务文件摘要如下。
+
+| 文件 | SHA-256 |
+| --- | --- |
+| `src/quantsim/database.py` | `909b05d62234f65f671dd403d52d53bfd426bb5289571001f38f0953a35868da` |
+| `src/quantsim/migrations/003_replay_results.sql` | `63bba168c762bbe822e0e44ea5d8b437618a1ca73611c30d06d90ceb9b0f2c8d` |
+| `src/quantsim/performance.py` | `a8a7e16fe052ce3304c481434ab6ebc5dced701d9afa3d82cb02ca187ef0ae68` |
+| `src/quantsim/replay.py` | `b3df11adc6a10369fd08623fb35cf38c208c8de633661f4a9431956ca9a20d73` |
+| `tests/test_database.py` | `ab6babd11682571b25445ddab91dee0551297ad9483231b28c8d402aafb63f1b` |
+| `tests/test_replay.py` | `d2178e3da7a78c1f615c1d5b0cebb2a47bcddc5ee16c464886109ee0586d25c6` |
+| `examples/replay_round_trip.py` | `760976f61331e240ff975d77df189513d699c0d8a6004fa096249173220e7d0a` |
+| `uv.lock` | `1c2748ca39bdb32ef6e4aa119e99c6cbf5ab03ed985ee8b4104cccdce4ec88bf` |
+
+## 复现命令
+
+```sh
+export MPLBACKEND=Agg MPLCONFIGDIR="$TMPDIR/mpl" XDG_CACHE_HOME="$TMPDIR/cache"
+uv --no-cache run --locked --no-sync python -m pytest -q
+uv --no-cache run --locked --no-sync python -m ruff check .
+uv --no-cache run --locked --no-sync python -m ruff format --check .
+git diff --check
+run_dir=$(mktemp -d "$TMPDIR/replay.XXXXXX")
+uv --no-cache run --locked --no-sync python examples/replay_round_trip.py --save-run "$run_dir"
+```
+
+## 通过条件
+
+1. **配置与重跑。** 另写一个短脚本，用公开接口运行三日 fixture。重开数据库读 `run.spec`，以新 UUID 重跑，核对相同配置、订单、成交、流水和权益的业务值。比较时排除运行派生 UUID，保留订单与成交的关联顺序。最终权益 1,009.77 USD，累计费 0.23 USD。
+2. **持久化及失败恢复。** 至少保存一个未完成前缀和终态绩效，重开读取两条。核对终态收益 0.977%、基准 20.000%，报告引用和实际 SHA-256 相符。触发不存在目录的发布失败，确认账本、已有记录不变，重新发布成功。删除报告后，读记录仍可用，从已提交区间重建。重复只保存绩效不会清除已有的报告。
+3. **旧库升级。** 用 `git archive HEAD` 提取旧源码到临时目录，通过旧版创建只提交前两日的版本 2 数据库。用当前源码升级并重复初始化，核对迁移版本、前两日记录及新接口，再继续提交第三日。可复用同一解释器，通过 `PYTHONPATH` 分别选择旧版和当前版，核对实际导入路径。
+
+报告区分本地回归与额外复现，逐项记录命令、数值和阻断项。范围为合成日频、单写入者和本机 PNG，不覆盖真实行情、并发多进程写入、跨机器文件迁移或 M5。
+
+## 验收结果
+
+DeepSeek 独立验收通过，八项摘要与任务单一致。复跑 106 项 pytest 及 Ruff 检查，另用独立脚本验证相同配置的账本、报告登记与重建，以及旧源码创建的版本 2 数据库升级后继续回放。报告 SHA-256 为 `d356fcf143fb2815b700fc0df02f61f84791588c1b42f0fd50ca21110fde2fe7`。
+
+</details>
+
+<!-- acceptance-history -->
+
+<details>
+<summary>M4-02 基准与统计验收记录</summary>
 
 ## 验收对象
 
@@ -39,7 +128,7 @@ uv --no-cache run --locked --no-sync python examples/replay_round_trip.py --repo
 
 DeepSeek 独立复验通过。首次模型会话完成 104 项全量测试、21 项局部测试、Ruff、出图和独立脚本，生成结论前超时。同一副本复验核对了七项摘要，重新执行独立脚本及示例，输出与首次复现一致，无阻断项。报告摘要见 [开发指南](../development_guide.md#m4-策略与绩效)。
 
-<!-- acceptance-history -->
+</details>
 
 <details>
 <summary>M4-01 波动率与合成调仓验收记录</summary>

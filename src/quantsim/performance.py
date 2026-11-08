@@ -6,18 +6,27 @@ Replay 提供连续的检查点及冻结日历, 本模块保留缺期并通过 A
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
+from hashlib import file_digest, sha256
 from itertools import pairwise
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 import pandas as pd
 
 from quantsim._account import account_context
+from quantsim.errors import ErrorCode, SimulatorError
 from quantsim.market_data import MarketDataRepository, Session
 from quantsim.toolkit_adapter import (
     PerformanceMetrics,
     replay_benchmark,
     replay_metrics,
+    replay_report,
 )
+
+if TYPE_CHECKING:
+    from matplotlib.figure import Figure
 
 
 @dataclass(frozen=True)
@@ -42,6 +51,24 @@ class PerformanceResult:
     days: tuple[DailyPerformance, ...]
     portfolio: PerformanceMetrics
     benchmark: PerformanceMetrics
+
+
+@dataclass(frozen=True)
+class ReplayRecord:
+    """与一个已提交区间和基准证券池对应的持久化绩效摘要"""
+
+    simulation_id: UUID
+    tick_seq: int
+    end_session: date
+    complete: bool
+    benchmark_instruments: tuple[UUID, ...]
+    benchmark_missing_sessions: tuple[date, ...]
+    currency: str
+    total_fees: Decimal
+    portfolio: PerformanceMetrics
+    benchmark: PerformanceMetrics
+    report_path: Path | None
+    report_sha256: str | None
 
 
 def _portfolio_returns(
@@ -131,3 +158,52 @@ def report_series(result: PerformanceResult) -> tuple[pd.Series, pd.Series]:
         dates[1:], tuple(day.benchmark_return for day in result.days[1:])
     )
     return portfolio, benchmark
+
+
+def render_report(
+    result: PerformanceResult,
+    *,
+    output: Path | None,
+    database_path: Path | None = None,
+) -> "Figure":
+    """渲染指定已提交区间的收益, 基准从第二日开始"""
+    portfolio, benchmark = report_series(result)
+    if portfolio.empty or portfolio.isna().any():
+        raise SimulatorError(ErrorCode.DATA_UNAVAILABLE, "报告需要连续的策略收益")
+    return replay_report(
+        portfolio, benchmark, output=output, database_path=database_path
+    )
+
+
+def publish_report(result: PerformanceResult, directory: Path) -> tuple[Path, str]:
+    """在同一目录渲染临时 PNG, 按内容摘要发布并保留已有文件"""
+    try:
+        with NamedTemporaryFile(dir=directory, suffix=".png", delete=False) as file:
+            temporary = Path(file.name)
+        try:
+            figure = render_report(result, output=temporary)
+            from matplotlib import pyplot as plt
+
+            plt.close(figure)
+            digest = sha256(temporary.read_bytes()).hexdigest()
+            output = directory / f"{result.simulation_id}-{digest}.png"
+            try:
+                output.hardlink_to(temporary)
+            except FileExistsError:
+                same_size = (
+                    not output.is_symlink()
+                    and output.is_file()
+                    and output.stat().st_size == temporary.stat().st_size
+                )
+                if same_size:
+                    with output.open("rb") as existing:
+                        if file_digest(existing, "sha256").hexdigest() == digest:
+                            return output, digest
+                raise SimulatorError(
+                    ErrorCode.INVALID_REQUEST, "报告目标已存在且内容不同"
+                ) from None
+        finally:
+            temporary.unlink(missing_ok=True)
+    except OSError as exc:
+        raise SimulatorError(ErrorCode.DATA_UNAVAILABLE, "无法发布回放报告") from exc
+    return output, digest

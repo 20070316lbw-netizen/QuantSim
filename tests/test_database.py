@@ -40,13 +40,15 @@ def test_initialize_database_can_be_repeated(tmp_path):
             "experiments",
             "backtest_runs",
             "schema_migrations",
+            "replay_results",
         } <= tables
         assert connection.execute("SELECT version FROM schema_info").fetchall() == [
-            (2,)
+            (3,)
         ]
         assert [(version, name) for version, name, _ in history] == [
             (1, "baseline"),
             (2, "migration_history"),
+            (3, "replay_results"),
         ]
         assert all(applied_at is not None for _, _, applied_at in history)
         assert (
@@ -97,7 +99,7 @@ def test_upgrade_preserves_data_and_is_repeatable(tmp_path):
     initialize_database(path)
     with duckdb.connect(path, read_only=True) as connection:
         assert connection.execute("SELECT version FROM schema_info").fetchall() == [
-            (2,)
+            (3,)
         ]
         assert connection.execute("SELECT name FROM strategies").fetchall() == [
             ("name",)
@@ -105,7 +107,11 @@ def test_upgrade_preserves_data_and_is_repeatable(tmp_path):
         assert connection.execute(
             "SELECT version, name, applied_at IS NOT NULL "
             "FROM schema_migrations ORDER BY version"
-        ).fetchall() == [(1, "baseline", False), (2, "migration_history", True)]
+        ).fetchall() == [
+            (1, "baseline", False),
+            (2, "migration_history", True),
+            (3, "replay_results", True),
+        ]
 
 
 def test_incomplete_migration_history_is_rejected(tmp_path):
@@ -131,23 +137,23 @@ def test_failed_upgrade_rolls_back_schema_and_version(tmp_path, monkeypatch):
     def broken_upgrade(connection):
         connection.execute("INSERT INTO missing_table VALUES (1)")
 
-    expected = database._V2_TABLES | {("main", "migration_example", "BASE TABLE")}
-    working_migrations = database._MIGRATIONS + ((3, "example", upgrade, expected),)
+    expected = database._V3_TABLES | {("main", "migration_example", "BASE TABLE")}
+    working_migrations = database._MIGRATIONS + ((4, "example", upgrade, expected),)
     monkeypatch.setattr(
         database,
         "_MIGRATIONS",
-        working_migrations + ((4, "broken", broken_upgrade, expected),),
+        working_migrations + ((5, "broken", broken_upgrade, expected),),
     )
     with pytest.raises(SimulatorError) as error:
         initialize_database(path)
     assert "missing_table" in str(error.value.__cause__)
     with duckdb.connect(path, read_only=True) as connection:
         assert connection.execute("SELECT version FROM schema_info").fetchall() == [
-            (2,)
+            (3,)
         ]
         assert connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
-        ).fetchall() == [(1,), (2,)]
+        ).fetchall() == [(1,), (2,), (3,)]
         assert ("migration_example",) not in connection.execute(
             "SHOW TABLES"
         ).fetchall()
@@ -156,8 +162,8 @@ def test_failed_upgrade_rolls_back_schema_and_version(tmp_path, monkeypatch):
     initialize_database(path)
     with duckdb.connect(path, read_only=True) as connection:
         assert connection.execute("SELECT version FROM schema_info").fetchall() == [
-            (3,)
+            (4,)
         ]
         assert connection.execute(
-            "SELECT name, applied_at IS NOT NULL FROM schema_migrations WHERE version = 3"
+            "SELECT name, applied_at IS NOT NULL FROM schema_migrations WHERE version = 4"
         ).fetchone() == ("example", True)
