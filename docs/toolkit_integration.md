@@ -2,7 +2,7 @@
 
 审计对象为本机 `/Users/liu/quant/QuantToolKit` 的 `main`，提交 `94532f91e0708ca20713b7660477da130e1aa6d6`，项目版本 `0.1.0`。源码和现有 DuckDB 只读审计。QuantSim 开发环境通过可编辑安装加载本机 QuantToolKit 工作目录。复现审计结果时使用上述提交。
 
-当前 [CI 固定版本](../.github/workflows/ci.yml) `b19c196` 的目录实测有 78 项契约，策略通道启用了 `panel.returns.historical_return`。下文逐项清单对应早期 70 项审计基线。新增能力在 M4/M5 启用前按当前版本核对。
+当前 [CI 固定版本](../.github/workflows/ci.yml) `b19c196` 的目录实测有 78 项契约。策略通道启用了 `panel.returns.historical_return`、`panel.volatility.history_vol` 和 `factors.combine.combine_scores`。合成分数使用 `factors.zscore.zscore_by_date` 做当日截面标准化。下文逐项清单对应早期 70 项审计基线。
 
 ## 目录、依赖与回测能力
 

@@ -6,7 +6,7 @@
 
 | 类型 | 字段及约束 |
 | --- | --- |
-| `ReplaySpec` | `simulation_id`、冻结 `data_version`、场景事件、固定策略、回放日期区间、期初现金、执行参数、Toolkit 修订、锁文件摘要和种子。运行记录从行情清单取得币种 |
+| `ReplaySpec` | `simulation_id`、冻结 `data_version`、场景事件、策略、回放日期区间、期初现金、执行参数、Toolkit 修订、锁文件摘要和种子。运行记录从行情清单取得币种 |
 | `Session` / `Tick` | `session_date: date` 为交易所当地交易日，`market_close_at`、`cutoff_at` 为带时区 UTC 时刻。Tick 加 `seq: int`，从 1 开始 |
 | `Bar` / `BarBatch` | 证券 ID、交易日、`bar_end_at`、`available_at`、原始 OHLC、成交量、可交易状态及来源。批次加 `data_version`、`as_of` |
 | `MarketView` | 按当前 `as_of` 截断的历史查询对象。只暴露有效证券和过去已发布的数据，包括当日已发布 bar |
@@ -90,9 +90,26 @@ def apply(
 def decide(context: StrategyContext) -> tuple[OrderIntent, ...]: ...
 ```
 
-当前 `StrategyContext` 含 `tick`、绑定该 tick 的 `market: MarketView`、当前股数 `positions` 及场景限制 `limits: ScenarioState`。完整组合快照和策略特征入口随策略扩展再接入。届时特征仍受当前 cutoff 约束，目标权重由策略层显式换算为订单。
+`StrategyContext` 含 `tick`、绑定该 tick 的 `market: MarketView`、当前股数 `positions` 及场景限制 `limits: ScenarioState`。策略通过绑定当前 `MarketView` 的 Adapter 读取特征。
 
 当前的 [FixedRoundTripStrategy](../src/quantsim/strategy.py) 用于三日验收。场景允许交易且当日存在可见原始 bar 时，第一日从空仓生成定量买入意图，第二日按实际持仓生成卖出意图。提交日的零量、历史停牌和 `tradable` 标记可以作为行情观察的一部分，订单的成交资格按目标 tick 的历史交易状态、行情和场景限制检查。
+
+将下列策略传给 `ReplaySpec.strategy` 可运行固定股数的动量轮换。`instruments` 是冻结批次内非空且无重复的 UUID 元组。`n_periods`、`rebalance_every` 和 `quantity` 均为正整数，回看期数小于 `2**31`，股数小于 `2**63`。非法配置返回 `INVALID_REQUEST`。
+
+```python
+strategy = MomentumRotationStrategy(
+    instruments=(instrument_a, instrument_b),
+    n_periods=1,
+    rebalance_every=2,
+    quantity=10,
+)
+```
+
+上例在 tick 1、3、5 等调仓。回看窗口可使用冻结批次中早于回放起点的历史。候选须在当日有可见、可交易且正成交量的原始 bar，并通过场景限制。策略按 `historical_return` 从高到低选一只，同分时取 UUID 最小者。窗口不足、所有候选都缺少有效收益或已有持仓当日不可交易时，跳过本次调仓。
+
+设置 `volatility_window` 可改用动量与低波动合成分数，取值为 2 至 2³¹−1 个交易日。策略只对两个特征均有效的候选做当日截面标准化，按 `(动量 z-score − 波动率 z-score) / 2` 排名。单证券截面或零方差因子的 z-score 取 0。合成分数与最高分的绝对差不超过 `1e-12` 时视为同分，取 UUID 最小者。没有可评分候选时跳过调仓。纯动量保存为 `momentum_rotation` 版本 1，合成分数保存为版本 2 并记录 `volatility_window`，恢复时按已保存版本计算。
+
+策略先提交卖出，再按目标股数提交买入。各订单在下一 tick 独立撮合，若遇到停牌、容量或现金约束，实际持仓可能偏离目标。下一次调仓以实际持仓为准。回放最后一日只处理到期订单。
 
 ## ExecutionEngine
 
@@ -140,7 +157,7 @@ class Replay:
     def step(self, tick_seq: int) -> PortfolioSnapshot: ...
 ```
 
-[回放入口](../src/quantsim/replay.py) 使用已初始化、已导入行情的 DuckDB 文件。创建运行时固定数据版本、日期、执行参数、`FixedRoundTripStrategy`、halt / resume 事件和依赖标识，并原子写入初始现金流水。调用者提供唯一 UUID 和依赖标识，确认回放区间无公司行动。币种来自冻结数据包。日期区间须在冻结日历首末日期内且包含交易日，货币单位及账户金额须能以 `DECIMAL(24,8)` 精确保存。创建时如 ID 已存在，使用构造函数打开既有运行。
+[回放入口](../src/quantsim/replay.py) 使用已初始化、已导入行情的 DuckDB 文件。创建运行时固定数据版本、日期、执行参数、策略及其版本、halt / resume 事件和依赖标识，并原子写入初始现金流水。支持 `FixedRoundTripStrategy` 和 `MomentumRotationStrategy`，打开既有运行时从已保存配置恢复策略。调用者提供唯一 UUID 和依赖标识，确认回放区间无公司行动。币种来自冻结数据包。日期区间须在冻结日历首末日期内且包含交易日，货币单位及账户金额须能以 `DECIMAL(24,8)` 精确保存。创建时如 ID 已存在，使用构造函数打开既有运行。
 
 `next_tick()` 从数据库查询下一未提交 tick，最后一日提交后返回 `None`。`step(seq)` 要求指定下一未提交序号或任一已提交序号。前者按场景、撮合、过账、估值和决策的顺序执行，最后一日处理到期单后结束。后者直接读取持久化快照。非法序号和跳步返回 `INVALID_REQUEST`。策略意图只在结构有效且证券属于冻结批次时接受。
 
@@ -180,6 +197,10 @@ def report(
 
 当前提供 [初始化](../src/quantsim/database.py)、[行情仓库](../src/quantsim/market_data.py) 与 [Toolkit Adapter](../src/quantsim/toolkit_adapter.py)。`import_batch` 接收冻结 JSON 文件的 Path。`market.view(data_version, session_date)` 从清单固定本次查询的交易日和 cutoff。`MarketView.sessions(lookback_sessions=N)` 返回截至当前交易日的最近 N 个冻结日历 session，包含缺少行情的交易日。
 
-`historical_return` 是当前启用的策略特征。`params` 为映射，可包含 `n_periods`，默认 5，范围为 1 至 2³¹−1。Adapter 按冻结日历向前数 `n_periods` 个交易日，用两端在当前 MarketView 的 cutoff 前已发布的原始 `close` 计算，含恰在 cutoff 发布的行情。起点超出 `lookback_sessions` 或缺价时，当前观察的收益为 `None`。中间交易日即使缺行也计入期数，只要两端价格都可见就可以计算。输出只包含实际可见的行情观察，并保留请求证券、截止时点及批次 ID。
+`panel.returns.historical_return` 的 `params` 可包含 `n_periods`，默认 5，范围为 1 至 2³¹−1。Adapter 按冻结日历向前数 `n_periods` 个交易日，用两端在当前 MarketView 的 cutoff 前已发布的原始 `close` 计算，含恰在 cutoff 发布的行情。起点超出 `lookback_sessions` 或缺价时，当前观察的收益为 `None`。中间交易日即使缺行也计入期数，只要两端价格都可见就可以计算。
+
+`panel.volatility.history_vol` 接收 `window`，默认 21，范围为 2 至 2³¹−1。它使用连续 `window + 1` 个交易日的可见原始收盘价，计算 `window` 个日收益的样本标准差，不年化。窗口内任意一天缺价或迟到时，对应波动率为 `None`。
+
+`factors.combine.combine_scores` 在策略通道中接收 `n_periods` 和 `window`，默认值同上。Adapter 对两项均有效的证券按日做截面标准化，再调用 Toolkit 合成动量与低波动分数。三个入口都只输出实际可见的行情观察，结果记录相关期数、请求证券、截止时点和批次 ID。
 
 `capabilities` 与 `describe` 可查看 Toolkit 目录。Toolkit 的当前计算入口为 `for_strategy` 所提供的特征。日频回放组件可分别调用，也可以通过 `Replay` 统一执行和恢复。绩效和报告接口按实施计划加入。

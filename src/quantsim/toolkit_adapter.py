@@ -2,8 +2,7 @@
 
 QuantToolkitAdapter.__init__ 加载并核对公开函数签名及来源契约
 capabilities 和 describe 查询能力, for_strategy 将当前 MarketView 绑定到 StrategyAnalytics
-StrategyAnalytics.feature 读取可见历史, 调用 Toolkit 的 to_date_ticker_frame 和 historical_return, 再转换为 FeatureResult
-当前仅 historical_return 在策略通道启用
+StrategyAnalytics.feature 读取可见历史, 计算历史收益、历史波动率或两者的合成分数
 """
 
 from collections.abc import Mapping
@@ -18,7 +17,10 @@ from quantsim.errors import ErrorCode, SimulatorError
 from quantsim.market_data import MarketView
 
 _HISTORICAL_RETURN = "panel.returns.historical_return"
+_HISTORY_VOL = "panel.volatility.history_vol"
+_COMBINE_SCORES = "factors.combine.combine_scores"
 _PREPARE_PANEL = "panel.transfer.to_date_ticker_frame"
+_STRATEGY_FEATURES = (_HISTORICAL_RETURN, _HISTORY_VOL, _COMBINE_SCORES)
 
 
 @dataclass(frozen=True)
@@ -42,10 +44,11 @@ class FeatureResult:
     as_of: datetime
     through_session: date
     lookback_sessions: int
-    n_periods: int
+    n_periods: int | None
     price_col: str
     requested_instruments: tuple[UUID, ...]
     points: tuple[FeaturePoint, ...]
+    window: int | None = None
 
 
 class QuantToolkitAdapter:
@@ -53,8 +56,11 @@ class QuantToolkitAdapter:
 
     def __init__(self) -> None:
         try:
+            from quanttoolkit.factors.combine import combine_scores
+            from quanttoolkit.factors.zscore import zscore_by_date
             from quanttoolkit.panel.returns import historical_return
             from quanttoolkit.panel.transfer import to_date_ticker_frame
+            from quanttoolkit.panel.volatility import history_vol
             from quanttoolkit.registry import get_contract, list_contracts
         except (ImportError, OSError) as exc:
             raise SimulatorError(
@@ -65,36 +71,58 @@ class QuantToolkitAdapter:
         self._list_contracts = list_contracts
         self._prepare_panel = to_date_ticker_frame
         self._historical_return = historical_return
+        self._history_vol = history_vol
+        self._zscore_by_date = zscore_by_date
+        self._combine_scores = combine_scores
+        capability = _PREPARE_PANEL
         try:
             prepare_spec = get_contract(_PREPARE_PANEL)
-            price_rule = get_contract(_HISTORICAL_RETURN)["inputs"]["df"]
             prepare_params = signature(to_date_ticker_frame).parameters
-            return_params = signature(historical_return).parameters
             if (
                 tuple(prepare_params) != ("df",)
-                or tuple(return_params) != ("df", "n_periods", "price_col")
-                or any(
-                    param.kind != Parameter.KEYWORD_ONLY
-                    for param in (*prepare_params.values(), *return_params.values())
-                )
+                or prepare_params["df"].kind != Parameter.KEYWORD_ONLY
                 or not prepare_spec["track"]
-                or price_rule["source_policy"] != "required"
-                or price_rule["check"] != "price"
-                or _PREPARE_PANEL not in price_rule["upstream"]
             ):
-                raise ValueError("签名或行情来源规则与策略特征绑定不匹配")
+                raise ValueError("行情准备入口不匹配")
+            for capability, calculate, size in (
+                (_HISTORICAL_RETURN, historical_return, "n_periods"),
+                (_HISTORY_VOL, history_vol, "window"),
+            ):
+                price_rule = get_contract(capability)["inputs"]["df"]
+                feature_params = signature(calculate).parameters
+                if (
+                    tuple(feature_params) != ("df", size, "price_col")
+                    or any(
+                        param.kind != Parameter.KEYWORD_ONLY
+                        for param in feature_params.values()
+                    )
+                    or price_rule["source_policy"] != "required"
+                    or price_rule["check"] != "price"
+                    or _PREPARE_PANEL not in price_rule["upstream"]
+                ):
+                    raise ValueError("签名或行情来源规则与策略特征绑定不匹配")
+            capability = _COMBINE_SCORES
+            factor_rule = get_contract(capability)["inputs"]["z"]
+            if (
+                tuple(signature(combine_scores).parameters) != ("z", "weights")
+                or tuple(signature(zscore_by_date).parameters)
+                != ("factors", "date_level")
+                or "factors.zscore.zscore_by_date" not in factor_rule["upstream"]
+                or factor_rule["source_policy"] == "required"
+            ):
+                raise ValueError("标准化或合成分数入口不匹配")
         except (KeyError, TypeError, ValueError) as exc:
             raise SimulatorError(
                 ErrorCode.DEPENDENCY_UNAVAILABLE,
-                f"QuantToolKit 的 {_PREPARE_PANEL} / {_HISTORICAL_RETURN} 契约与 QuantSim 策略特征绑定不匹配",
-                capability=_HISTORICAL_RETURN,
+                f"QuantToolKit 的 {capability} 契约与 QuantSim 策略特征绑定不匹配",
+                capability=capability,
             ) from exc
 
     def capabilities(
         self, *, stage: str | None = None, workflow: str | None = None
     ) -> tuple[Capability, ...]:
         return tuple(
-            Capability(name, spec, name == _HISTORICAL_RETURN)
+            Capability(name, spec, name in _STRATEGY_FEATURES)
             for name, spec in self._list_contracts(
                 stage=stage, workflow=workflow
             ).items()
@@ -107,7 +135,7 @@ class QuantToolkitAdapter:
             raise SimulatorError(
                 ErrorCode.UNKNOWN_CAPABILITY, f"未知能力 {name}", capability=name
             ) from exc
-        return Capability(name, spec, name == _HISTORICAL_RETURN)
+        return Capability(name, spec, name in _STRATEGY_FEATURES)
 
     def for_strategy(self, *, market: MarketView) -> "StrategyAnalytics":
         return StrategyAnalytics(self, market)
@@ -131,6 +159,7 @@ class StrategyAnalytics:
         """按冻结交易日历计算策略特征, 只返回实际可见行情对应的点
 
         historical_return 的端点缺失时返回 None, 缺失交易日仍计入期数
+        history_vol 的窗口需要连续价格, 合成分数只使用两个特征均有效的证券
         """
         if not self._adapter.describe(name).enabled_for_strategy:
             raise SimulatorError(
@@ -141,17 +170,23 @@ class StrategyAnalytics:
                 ErrorCode.INVALID_REQUEST, "params 须为参数映射", capability=name
             )
         params = {} if params is None else params
-        n_periods = params.get("n_periods", 5)
-        if (
-            set(params) - {"n_periods"}
-            or type(n_periods) is not int
-            or not 1 <= n_periods < 2**31
+        defaults = {
+            _HISTORICAL_RETURN: {"n_periods": 5},
+            _HISTORY_VOL: {"window": 21},
+            _COMBINE_SCORES: {"n_periods": 5, "window": 21},
+        }[name]
+        sizes = {**defaults, **params}
+        if set(params) - defaults.keys() or any(
+            type(size) is not int or not (2 if key == "window" else 1) <= size < 2**31
+            for key, size in sizes.items()
         ):
             raise SimulatorError(
                 ErrorCode.INVALID_REQUEST,
-                "仅允许传入 1 至 2³¹−1 的整数 n_periods，价格列固定为 close",
+                "n_periods 须在 1 至 2³¹−1，window 须在 2 至 2³¹−1，价格列固定为 close",
                 capability=name,
             )
+        n_periods = sizes.get("n_periods")
+        window = sizes.get("window")
         sessions = self._market.sessions(lookback_sessions=lookback_sessions)
         batch = self._market.history(instruments, lookback_sessions=lookback_sessions)
         instrument_by_ticker = {bar.ticker: bar.instrument_id for bar in batch.bars}
@@ -165,13 +200,29 @@ class StrategyAnalytics:
             names=prices.index.names,
         )
         frame = prices.reindex(calendar_index).reset_index()
-        periods = min(n_periods, len(sessions))
         try:
             # 保留入口返回的对象身份，下游按此检查来源
             panel = self._adapter._prepare_panel(df=frame)
-            values = self._adapter._historical_return(
-                df=panel, n_periods=periods, price_col="close"
-            )
+            if n_periods is not None:
+                values = self._adapter._historical_return(
+                    df=panel, n_periods=min(n_periods, len(sessions)), price_col="close"
+                )
+            if window is not None:
+                volatility = self._adapter._history_vol(
+                    df=panel,
+                    window=min(window, max(2, len(sessions))),
+                    price_col="close",
+                )
+                if n_periods is None:
+                    values = volatility
+                else:
+                    factors = pd.DataFrame(
+                        {"momentum": values, "volatility": volatility}
+                    ).dropna()
+                    standardized = self._adapter._zscore_by_date(factors).fillna(0.0)
+                    values = self._adapter._combine_scores(
+                        standardized, weights={"momentum": 1.0, "volatility": -1.0}
+                    ).reindex(panel.index)
         except (TypeError, ValueError, KeyError) as exc:
             raise SimulatorError(
                 ErrorCode.TOOLKIT_INPUT_REJECTED,
@@ -208,4 +259,5 @@ class StrategyAnalytics:
             "close",
             tuple(instruments),
             points,
+            window,
         )

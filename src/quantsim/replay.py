@@ -32,10 +32,17 @@ from quantsim.market_data import MarketDataRepository, Tick
 from quantsim.portfolio import BookingResult, PortfolioSnapshot, PositionMark
 from quantsim.scenario import ScenarioEvent, ScenarioEventEngine, ScenarioState
 from quantsim.simulation_clock import SimulationClock
-from quantsim.strategy import FixedRoundTripStrategy, OrderIntent, StrategyContext
+from quantsim.strategy import (
+    FixedRoundTripStrategy,
+    MomentumRotationStrategy,
+    OrderIntent,
+    StrategyContext,
+)
 
-_STRATEGY_NAME = "fixed_round_trip"
+_FIXED_ROUND_TRIP = "fixed_round_trip"
+_MOMENTUM_ROTATION = "momentum_rotation"
 _STRATEGY_VERSION = "1"
+_COMPOSITE_STRATEGY_VERSION = "2"
 _SCENARIO_VERSION = "halt_resume:1"
 
 
@@ -47,7 +54,7 @@ class ReplaySpec:
     end_session: date
     initial_cash: Decimal
     execution: ExecutionConfig
-    strategy: FixedRoundTripStrategy
+    strategy: FixedRoundTripStrategy | MomentumRotationStrategy
     toolkit_revision: str
     lock_hash: str
     scenario_events: tuple[ScenarioEvent, ...] = ()
@@ -89,16 +96,27 @@ class Replay:
             code_version,
             strategy,
         ) = row
-        if (scenario_version, name, code_version) != (
-            _SCENARIO_VERSION,
-            _STRATEGY_NAME,
-            _STRATEGY_VERSION,
+        if scenario_version != _SCENARIO_VERSION or (name, code_version) not in (
+            (_FIXED_ROUND_TRIP, _STRATEGY_VERSION),
+            (_MOMENTUM_ROTATION, _STRATEGY_VERSION),
+            (_MOMENTUM_ROTATION, _COMPOSITE_STRATEGY_VERSION),
         ):
             raise SimulatorError(ErrorCode.INCONSISTENT_STATE, "回放配置版本不受支持")
         strategy = json.loads(strategy)
-        self._strategy = FixedRoundTripStrategy(
-            UUID(strategy["instrument_id"]), strategy["quantity"]
-        )
+        if name == _FIXED_ROUND_TRIP:
+            self._strategy = FixedRoundTripStrategy(
+                UUID(strategy["instrument_id"]), strategy["quantity"]
+            )
+        else:
+            self._strategy = MomentumRotationStrategy(
+                tuple(UUID(value) for value in strategy["instruments"]),
+                strategy["n_periods"],
+                strategy["rebalance_every"],
+                strategy["quantity"],
+                strategy["volatility_window"]
+                if code_version == _COMPOSITE_STRATEGY_VERSION
+                else None,
+            )
         self._execution = ExecutionConfig(
             **{key: Decimal(value) for key, value in json.loads(execution).items()}
         )
@@ -128,9 +146,6 @@ class Replay:
             or spec.start_session > spec.end_session
             or not isinstance(spec.execution, ExecutionConfig)
             or not isinstance(spec.scenario_events, tuple)
-            or type(spec.strategy) is not FixedRoundTripStrategy
-            or not isinstance(spec.strategy.instrument_id, UUID)
-            or spec.strategy.quantity >= 2**63
             or type(spec.seed) is not int
             or not -(2**63) <= spec.seed < 2**63
             or not all(
@@ -139,6 +154,37 @@ class Replay:
             )
         ):
             raise SimulatorError(ErrorCode.INVALID_REQUEST, "回放配置无效")
+        strategy = spec.strategy
+        code_version = _STRATEGY_VERSION
+        if type(strategy) is FixedRoundTripStrategy:
+            if (
+                not isinstance(strategy.instrument_id, UUID)
+                or strategy.quantity >= 2**63
+            ):
+                raise SimulatorError(ErrorCode.INVALID_REQUEST, "固定策略配置无效")
+            name = _FIXED_ROUND_TRIP
+            instruments = (strategy.instrument_id,)
+            config = _json(
+                {
+                    "instrument_id": str(strategy.instrument_id),
+                    "quantity": strategy.quantity,
+                }
+            )
+        elif type(strategy) is MomentumRotationStrategy:
+            name = _MOMENTUM_ROTATION
+            instruments = strategy.instruments
+            params = {
+                "instruments": [str(instrument) for instrument in instruments],
+                "n_periods": strategy.n_periods,
+                "rebalance_every": strategy.rebalance_every,
+                "quantity": strategy.quantity,
+            }
+            if strategy.volatility_window is not None:
+                params["volatility_window"] = strategy.volatility_window
+                code_version = _COMPOSITE_STRATEGY_VERSION
+            config = _json(params)
+        else:
+            raise SimulatorError(ErrorCode.INVALID_REQUEST, "回放策略不受支持")
         validate_execution_config(spec.execution)
         _check_money((spec.execution.currency_unit,), ErrorCode.INVALID_REQUEST)
         initial = portfolio.initialize(
@@ -166,15 +212,7 @@ class Replay:
         assert first is not None
         ScenarioEventEngine.apply(first, ScenarioState(), spec.scenario_events)
         events = sorted(spec.scenario_events, key=lambda event: event.scenario_sequence)
-        strategy = _json(
-            {
-                "instrument_id": str(spec.strategy.instrument_id),
-                "quantity": spec.strategy.quantity,
-            }
-        )
-        definition = sha256(
-            _json([_STRATEGY_NAME, _STRATEGY_VERSION, strategy]).encode()
-        ).hexdigest()
+        definition = sha256(_json([name, code_version, config]).encode()).hexdigest()
         strategy_id = uuid5(NAMESPACE_URL, f"quantsim:strategy:{definition}")
 
         with _connection(path, write=True) as db:
@@ -190,7 +228,7 @@ class Replay:
             _check_instruments(
                 db,
                 spec.data_version,
-                {spec.strategy.instrument_id}
+                set(instruments)
                 | {
                     event.instrument_id
                     for event in events
@@ -202,7 +240,7 @@ class Replay:
                 INSERT INTO strategies (strategy_id, name, code_version, config, definition_hash)
                 VALUES (?, ?, ?, ?, ?) ON CONFLICT (definition_hash) DO NOTHING
                 """,
-                [strategy_id, _STRATEGY_NAME, _STRATEGY_VERSION, strategy, definition],
+                [strategy_id, name, code_version, config, definition],
             )
             db.execute(
                 """

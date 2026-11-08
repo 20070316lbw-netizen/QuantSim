@@ -6,6 +6,7 @@ test_toolkit_public_price_contract_survives_adapter_integration 检查公开来�
 test_strategy_error_preserves_toolkit_source_rejection 检查异常链, 内部 copy_prepared_panel 模拟来源丢失
 test_feature_without_any_visible_bar_has_no_points 检查空行情结果
 test_historical_return_counts_sessions_with_missing_bars 检查缺行时的交易日期数
+test_history_vol_uses_only_complete_visible_windows 对照工具箱并检查窗口不足及迟到行情
 """
 
 import json
@@ -17,12 +18,14 @@ import pytest
 from conftest import FIXTURE
 from quanttoolkit.panel.returns import historical_return
 from quanttoolkit.panel.transfer import prepare_price_panel
+from quanttoolkit.panel.volatility import history_vol
 from quanttoolkit.registry import list_contracts
 
 from quantsim.errors import ErrorCode, SimulatorError
 from quantsim.toolkit_adapter import QuantToolkitAdapter
 
 FEATURE = "panel.returns.historical_return"
+VOLATILITY = "panel.volatility.history_vol"
 A = UUID(int=1)
 B = UUID(int=2)
 
@@ -63,6 +66,8 @@ def test_strategy_feature_reuses_toolkit_with_visible_market_data(market):
         (FEATURE, {"n_periods": 2**31}, ErrorCode.INVALID_REQUEST),
         (FEATURE, [], ErrorCode.INVALID_REQUEST),
         (FEATURE, {"price_col": "invalid"}, ErrorCode.INVALID_REQUEST),
+        (VOLATILITY, {"window": 1}, ErrorCode.INVALID_REQUEST),
+        (VOLATILITY, {"n_periods": 2}, ErrorCode.INVALID_REQUEST),
     ],
 )
 def test_strategy_rejects_disabled_capabilities_and_invalid_parameters(
@@ -154,3 +159,39 @@ def test_historical_return_counts_sessions_with_missing_bars(
     ]
     assert points[0].value is None
     assert points[1].value == (None if expected is None else pytest.approx(expected))
+
+
+@pytest.mark.parametrize("late", [False, True])
+def test_history_vol_uses_only_complete_visible_windows(market, tmp_path, late):
+    data = json.loads(FIXTURE.read_text())
+    if late:
+        bar = next(
+            bar
+            for bar in data["bars"]
+            if (bar["instrument_key"], bar["session_date"]) == ("A", "2024-07-03")
+        )
+        bar["available_at"] = "2024-07-05T20:01:00Z"
+    path = tmp_path / "volatility.json"
+    path.write_text(json.dumps(data))
+    version = market.import_batch(path).data_version
+    analytics = QuantToolkitAdapter().for_strategy(
+        market=market.view(version, date(2024, 7, 5))
+    )
+    result = analytics.feature(
+        VOLATILITY, (A,), lookback_sessions=3, params={"window": 2}
+    )
+    assert result.window == 2
+    assert result.n_periods is None
+    assert all(point.value is None for point in result.points[:-1])
+    if late:
+        assert result.points[-1].value is None
+    else:
+        index = pd.MultiIndex.from_product(
+            [pd.to_datetime(["2024-07-02", "2024-07-03", "2024-07-05"]), ["A"]],
+            names=["date", "ticker"],
+        )
+        panel = prepare_price_panel(
+            pd.DataFrame({"close": [10.0, 11.0, 22.0]}, index=index)
+        )
+        expected = history_vol(df=panel, window=2, price_col="close").iloc[-1]
+        assert result.points[-1].value == pytest.approx(expected)
